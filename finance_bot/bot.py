@@ -27,6 +27,7 @@ import database as db  # noqa: E402
 import sheets_engine  # noqa: E402
 from chart_engine import build_month_chart  # noqa: E402
 from debt_engine import avalanche_savings  # noqa: E402
+from statements import insights  # noqa: E402
 from statements.report import build_report, default_start, format_telegram  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -76,7 +77,8 @@ HELP_TEXT = (
     "/add_expense <code>сумма категория [описание]</code> — записать расход\n"
     "   например: <code>/add_expense 450 Еда обед в кафе</code>\n"
     "/stats — диаграмма расходов за текущий месяц\n"
-    "/report <code>[ГГГГ-ММ-ДД]</code> — отчёт по загруженным банковским выпискам\n\n"
+    "/report <code>[ГГГГ-ММ-ДД]</code> — отчёт по загруженным банковским выпискам\n"
+    "/advice <code>[ГГГГ-ММ-ДД]</code> — комментарии и советы по тратам (с ключом Gemini — и от нейросети)\n\n"
     "<b>Долги</b>\n"
     "/add_debt — добавить долг (пошаговый диалог)\n"
     "/debts — список долгов и порядок погашения по «Лавине»\n"
@@ -380,6 +382,46 @@ async def cmd_report(message: Message, command: CommandObject) -> None:
     await message.answer(text)
 
 
+# ---------- /advice (комментарии и рекомендации) ----------
+
+def _advice_parts(start: str) -> tuple[list[str], dict] | None:
+    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        ins = insights.build_insights(conn, start)
+    finally:
+        conn.close()
+    if not ins:
+        return None
+    return insights.rule_comments(ins), insights.ai_summary(ins)
+
+
+@router.message(Command("advice"))
+async def cmd_advice(message: Message, command: CommandObject) -> None:
+    start = default_start()
+    if command.args:
+        try:
+            start = date.fromisoformat(command.args.strip()).isoformat()
+        except ValueError:
+            await message.answer("Формат: <code>/advice [ГГГГ-ММ-ДД]</code>")
+            return
+    parts = await asyncio.to_thread(_advice_parts, start)
+    if parts is None:
+        await message.answer("Нужен хотя бы один полный месяц операций из выписок (см. /report).")
+        return
+    comments, summary = parts
+    await message.answer("<b>Наблюдения</b>\n" + "\n".join("• " + escape(c) for c in comments))
+    if not os.getenv("GEMINI_API_KEY"):
+        await message.answer("Совет от нейросети выключен: добавьте GEMINI_API_KEY в .env (см. README).")
+        return
+    wait = await message.answer("Спрашиваю Gemini (отправляю только суммы по категориям)…")
+    try:
+        text = await asyncio.to_thread(insights.ai_advice, summary)
+    except RuntimeError as e:
+        await wait.edit_text(escape(str(e)))
+        return
+    await wait.edit_text("<b>Совет нейросети</b>\n" + escape(text))
+
+
 # ---------- Запуск ----------
 
 async def main() -> None:
@@ -402,6 +444,7 @@ async def main() -> None:
         BotCommand(command="add_expense", description="Записать расход"),
         BotCommand(command="stats", description="Диаграмма расходов за месяц"),
         BotCommand(command="report", description="Отчёт по банковским выпискам"),
+        BotCommand(command="advice", description="Комментарии и советы по тратам"),
         BotCommand(command="add_debt", description="Добавить долг"),
         BotCommand(command="debts", description="Долги и план «Лавина»"),
         BotCommand(command="cancel", description="Отменить диалог"),

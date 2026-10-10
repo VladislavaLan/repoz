@@ -12,6 +12,7 @@ from decimal import Decimal
 
 from statements import alfa, config, sber
 from statements import normalize as nz
+from statements import insights
 from statements.importer import dedupe, write
 from statements.report import build_report, format_telegram
 
@@ -140,6 +141,39 @@ class ImportAndReport(unittest.TestCase):
 
     def test_report_without_table_or_rows(self):
         self.assertIsNone(build_report(sqlite3.connect(":memory:"), "2026-01-01"))
+
+
+class Insights(unittest.TestCase):
+    def _conn(self):
+        conn = sqlite3.connect(":memory:")
+        rows = []
+        for i, mon in enumerate(["2026-04", "2026-05", "2026-06"]):
+            rows += [
+                nz.Txn("s", f"in{i}", date.fromisoformat(mon + "-02"), None, 10_000_000, "income", "Зарплата", "", ""),
+                nz.Txn("s", f"sub{i}", date.fromisoformat(mon + "-05"), None, -50_000, "expense", "Связь и подписки",
+                       "SECRET VPN", ""),
+                nz.Txn("s", f"f{i}", date.fromisoformat(mon + "-06"), None, -(100_000 + i * 100_000), "expense",
+                       "Продукты", "SHOP" + str(i), ""),
+            ]
+        rows.append(nz.Txn("s", "big", date(2026, 6, 10), None, -3_000_000, "expense", "Здоровье", "KLINIKA", ""))
+        write(conn, rows)
+        return conn
+
+    def test_comments_and_anonymous_summary(self):
+        ins = insights.build_insights(self._conn(), "2026-04-01")
+        text = "\n".join(insights.rule_comments(ins))
+        self.assertIn("Регулярные списания", text)
+        self.assertIn("Крупных разовых покупок: 1", text)
+        summary = insights.ai_summary(ins)
+        dumped = str(summary)
+        for secret in ("SECRET VPN", "SHOP", "KLINIKA"):
+            self.assertNotIn(secret, dumped)          # в нейросеть уходят только категории и суммы
+        self.assertEqual(summary["big_purchases_count"], 1)
+
+    def test_ai_needs_key(self):
+        os.environ.pop("GEMINI_API_KEY", None)
+        with self.assertRaises(RuntimeError):
+            insights.ai_advice({})
 
 
 if __name__ == "__main__":
