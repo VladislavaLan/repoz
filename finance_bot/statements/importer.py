@@ -153,6 +153,10 @@ def main(argv: list[str] | None = None) -> int:
         for f, source, txns in loaded:
             new, upd = write(conn, txns)
             print(f"{f.name}: добавлено {new}, обновлено {upd}")
+        from .screenshot import drop_screenshot_dupes
+        n = drop_screenshot_dupes(conn)
+        if n:
+            print(f"Убрано {n} операций из скриншотов: они теперь есть в выписках.")
     finally:
         conn.close()
     return 1 if failed else 0

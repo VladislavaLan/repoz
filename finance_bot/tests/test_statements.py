@@ -12,7 +12,7 @@ from decimal import Decimal
 
 from statements import alfa, config, sber
 from statements import normalize as nz
-from statements import insights
+from statements import insights, screenshot
 from statements.importer import dedupe, write
 from statements.report import build_report, format_telegram
 
@@ -174,6 +174,80 @@ class Insights(unittest.TestCase):
         os.environ.pop("GEMINI_API_KEY", None)
         with self.assertRaises(RuntimeError):
             insights.ai_advice({})
+
+
+SHOT = [
+    "23:16 VPN 6", "История", "Пополнение Списание Даты",
+    "Сегодня, 10 октября",
+    "Лента −434,97 ₽ ©", "Продукты +4 ₽",
+    "Перевод себе в другой ба... −3 700 ₽", "Переводы · СБП · Озон (Еком Банк)", "Перевод денежных средств",
+    "Лента -4 516,97 P", "Продукты +45 ₽",
+    "МТС 9000000007 -9 ₽", "Связь, интернет и ТВ",
+    "Вчера, 9 октября",
+    "Перевод в Сбербанк п... −24 300 ₽", "Финансовые операции", "Перевод собственных средств",
+    "Перевод −30000 ₽", "Между своими счетами",
+    "Иван П. −15 000 ₽", "Переводы · СБП · Сбербанк",
+    "Зарплата +1 000 ₽", "Пополнение",
+]
+
+
+class Screenshots(unittest.TestCase):
+    def setUp(self):
+        os.environ["STATEMENTS_CONFIG"] = "/nonexistent.json"
+        config.reset()
+
+    def _txns(self):
+        return screenshot.to_txns(screenshot.parse_lines(SHOT, date(2026, 10, 10)))
+
+    def test_parse_classify(self):
+        ts = self._txns()
+        self.assertEqual([t.amount_kop for t in ts], [-43497, -370000, -451697, -900, -2430000, -3000000, -1500000, 100000])
+        self.assertEqual([t.date.day for t in ts], [10, 10, 10, 10, 9, 9, 9, 9])
+        self.assertEqual([t.type for t in ts], ["expense", "transfer", "expense", "expense", "transfer", "transfer",
+                                                 "p2p_out", "income"])
+        self.assertEqual(ts[0].category, "Продукты")
+        self.assertEqual(ts[3].category, "Связь и подписки")      # по категории банка
+        self.assertIn("…0007", ts[3].merchant)                    # номер телефона не сохраняем целиком
+        self.assertNotIn("9000000007", ts[3].merchant)
+
+    def test_people_from_config(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+            f.write('{"people": {"Иван П.": "family"}}')
+        os.environ["STATEMENTS_CONFIG"] = f.name
+        config.reset()
+        try:
+            self.assertEqual(self._txns()[6].type, "family_out")
+        finally:
+            os.unlink(f.name)
+            os.environ["STATEMENTS_CONFIG"] = "/nonexistent.json"
+            config.reset()
+
+    def test_year_rolls_back_for_future_month(self):
+        ops = screenshot.parse_lines(["31 декабря", "Кафе −100 ₽"], date(2026, 1, 5))
+        self.assertEqual(ops[0].day, date(2025, 12, 31))
+
+    def test_dupes_with_statements_both_ways(self):
+        conn = sqlite3.connect(":memory:")
+        shots = self._txns()
+        stmt = nz.Txn("alfa_1", "st1", date(2026, 10, 9), None, -43497, "expense", "Продукты", "LENTA", "")
+        write(conn, [stmt])
+        dup = screenshot.find_statement_dupes(conn, shots)       # дата ±1 день, сумма та же
+        self.assertEqual(dup, {shots[0].fingerprint})
+        write(conn, [t for t in shots if t.fingerprint not in dup])
+        stmt2 = nz.Txn("alfa_1", "st2", date(2026, 10, 10), None, -900, "expense", "Связь и подписки", "MTS", "")
+        write(conn, [stmt2])
+        self.assertEqual(screenshot.drop_screenshot_dupes(conn), 1)   # пришла выписка — строка скриншота убрана
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM transactions WHERE source='screenshot'").fetchone()[0], 6)
+
+    def test_ocr_error_is_readable(self):
+        os.environ["TESSERACT_CMD"] = "/nonexistent"
+        try:
+            old, screenshot.shutil.which = screenshot.shutil.which, lambda _: None
+            with self.assertRaises(RuntimeError):
+                screenshot.ocr_lines("x.jpg")
+        finally:
+            screenshot.shutil.which = old
+            os.environ.pop("TESSERACT_CMD", None)
 
 
 if __name__ == "__main__":
