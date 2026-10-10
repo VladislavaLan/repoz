@@ -150,13 +150,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Копия базы: {b}")
     conn = sqlite3.connect(args.db)
     try:
+        from .manual import sync_manual
+        added = sync_manual(conn)
+        if added:
+            print(f"Ручные траты из бота скопированы в общую таблицу: {added}")
         for f, source, txns in loaded:
             new, upd = write(conn, txns)
             print(f"{f.name}: добавлено {new}, обновлено {upd}")
         from .screenshot import drop_screenshot_dupes
         n = drop_screenshot_dupes(conn)
         if n:
-            print(f"Убрано {n} операций из скриншотов: они теперь есть в выписках.")
+            print(f"Помечено {n} ручных/скриншотных операций как дубли: они теперь есть в выписках.")
     finally:
         conn.close()
     return 1 if failed else 0

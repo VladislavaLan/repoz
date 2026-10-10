@@ -12,7 +12,7 @@ from decimal import Decimal
 
 from statements import alfa, config, sber
 from statements import normalize as nz
-from statements import insights, screenshot
+from statements import insights, manual, screenshot
 from statements.importer import dedupe, write
 from statements.report import build_report, format_telegram
 
@@ -237,7 +237,7 @@ class Screenshots(unittest.TestCase):
         stmt2 = nz.Txn("alfa_1", "st2", date(2026, 10, 10), None, -900, "expense", "Связь и подписки", "MTS", "")
         write(conn, [stmt2])
         self.assertEqual(screenshot.drop_screenshot_dupes(conn), 1)   # пришла выписка — строка скриншота убрана
-        self.assertEqual(conn.execute("SELECT COUNT(*) FROM transactions WHERE source='screenshot'").fetchone()[0], 6)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM transactions WHERE source='screenshot' AND type!='duplicate'").fetchone()[0], 6)
 
     def test_ocr_error_is_readable(self):
         os.environ["TESSERACT_CMD"] = "/nonexistent"
@@ -248,6 +248,52 @@ class Screenshots(unittest.TestCase):
         finally:
             screenshot.shutil.which = old
             os.environ.pop("TESSERACT_CMD", None)
+
+
+class ManualExpenses(unittest.TestCase):
+    def setUp(self):
+        os.environ["STATEMENTS_CONFIG"] = "/nonexistent.json"
+        config.reset()
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.execute("CREATE TABLE expenses (id INTEGER PRIMARY KEY AUTOINCREMENT, amount REAL, category TEXT, "
+                          "description TEXT, date TEXT)")
+        self.conn.execute("INSERT INTO expenses (amount, category, description, date) VALUES (450, 'Еда', 'обед', '2026-10-09')")
+        self.conn.commit()
+
+    def test_sync_is_idempotent_and_keeps_entered_category(self):
+        self.assertEqual(manual.sync_manual(self.conn), 1)
+        self.assertEqual(manual.sync_manual(self.conn), 0)
+        row = self.conn.execute("SELECT amount_kop, category, type, source FROM transactions").fetchone()
+        self.assertEqual(row, (-45000, "Еда", "expense", "manual"))
+
+    def test_alias_from_config(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+            f.write('{"category_aliases": {"еда": "Продукты"}}')
+        os.environ["STATEMENTS_CONFIG"] = f.name
+        config.reset()
+        try:
+            manual.sync_manual(self.conn)
+            self.assertEqual(self.conn.execute("SELECT category FROM transactions").fetchone()[0], "Продукты")
+        finally:
+            os.unlink(f.name)
+            os.environ["STATEMENTS_CONFIG"] = "/nonexistent.json"
+            config.reset()
+
+    def test_statement_replaces_manual_row_and_it_does_not_come_back(self):
+        manual.sync_manual(self.conn)
+        write(self.conn, [nz.Txn("alfa_1", "st", date(2026, 10, 10), None, -45000, "expense", "Кафе и рестораны",
+                                 "CAFE", "")])
+        self.assertEqual(screenshot.drop_screenshot_dupes(self.conn), 1)
+        manual.sync_manual(self.conn)                       # повторная синхронизация ничего не возвращает
+        n = self.conn.execute("SELECT COUNT(*) FROM transactions WHERE type = 'expense'").fetchone()[0]
+        self.assertEqual(n, 1)
+        r = build_report(self.conn, "2026-10-01")
+        self.assertAlmostEqual(r["totals"]["spend"], 450.0, places=2)    # трата посчитана один раз
+
+    def test_category_list_has_main_categories(self):
+        cats = nz.all_categories()
+        for c in ("Продукты", "Транспорт", "Прочее"):
+            self.assertIn(c, cats)
 
 
 if __name__ == "__main__":

@@ -119,12 +119,6 @@ def build_report(conn: sqlite3.Connection, start: str | None = None, big_limit: 
             "per_month_no_big": (full_sum - big_c) / n_full if n_full else None,
         })
 
-    manual = None
-    if _has_table(conn, "expenses"):
-        r = conn.execute("SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM expenses WHERE date >= ?", (start,)).fetchone()
-        if r[0]:
-            manual = (r[0], r[1])
-
     return {
         "start": start, "end": end, "months": months, "full_months": full, "by_m": by_m,
         "avg": {k: avg(k) for k in ("income", "spend", "p2p", "family")},
@@ -134,7 +128,6 @@ def build_report(conn: sqlite3.Connection, start: str | None = None, big_limit: 
         "cats": cat_rows, "interest": interest, "fees": fees,
         "top_merchants": sorted(((m, v[0], v[1]) for m, v in merchants.items()), key=lambda x: -x[1])[:12],
         "income_cats": sorted(income_cats.items(), key=lambda kv: -kv[1]),
-        "manual": manual,
     }
 
 
@@ -166,10 +159,6 @@ def format_telegram(r: dict) -> str:
         lines.append(f"• {escape(c['category'])}: {rub(c['total'])} ({c['share']:.0f}%)")
     if r["interest"] or r["fees"]:
         lines += ["", f"Проценты по кредитке: {rub(r['interest'])} · комиссии: {rub(r['fees'])}"]
-    if r["manual"]:
-        n, s = r["manual"]
-        lines += ["", f"<i>Ручных трат из бота за период: {n} на {rub(s)} — в отчёт не входят "
-                      f"(могут дублировать покупки из выписок).</i>"]
     return "\n".join(lines)
 
 
@@ -201,8 +190,6 @@ def format_cli(r: dict) -> str:
     out += ["", "Доходы:"] + [f"  {c:<16}{v:>12,.0f}" for c, v in r["income_cats"]]
     out += ["", f"Итого: доход {t['income']:,.0f} | траты {t['spend']:,.0f} | людям (чистые) {t['p2p']:,.0f} | "
                 f"семье (чистые) {t['family']:,.0f}"]
-    if r["manual"]:
-        out.append(f"Ручных трат из бота: {r['manual'][0]} на {r['manual'][1]:,.0f} ₽ (в отчёт не входят)")
     return "\n".join(out)
 
 

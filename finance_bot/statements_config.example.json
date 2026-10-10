@@ -17,5 +17,8 @@
   "big_purchase": 20000,
   "people": {
     "Иван П.": "family"
+  },
+  "category_aliases": {
+    "Еда": "Продукты"
   }
 }

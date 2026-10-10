@@ -30,7 +30,8 @@ import database as db  # noqa: E402
 import sheets_engine  # noqa: E402
 from chart_engine import build_month_chart  # noqa: E402
 from debt_engine import avalanche_savings  # noqa: E402
-from statements import insights, screenshot  # noqa: E402
+from statements import insights, manual, screenshot  # noqa: E402
+from statements import normalize as nz  # noqa: E402
 from statements.importer import write as write_txns  # noqa: E402
 from statements.report import build_report, default_start, format_telegram  # noqa: E402
 
@@ -112,6 +113,17 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
 
 # ---------- /add_expense ----------
 
+def _sync_manual() -> int:
+    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        return manual.sync_manual(conn)
+    except sqlite3.Error:
+        log.exception("Не удалось скопировать ручные траты в transactions")
+        return 0
+    finally:
+        conn.close()
+
+
 @router.message(Command("add_expense"))
 async def cmd_add_expense(message: Message, command: CommandObject) -> None:
     usage = "Формат: <code>/add_expense сумма категория [описание]</code>\nНапример: <code>/add_expense 450 Еда обед</code>"
@@ -132,6 +144,7 @@ async def cmd_add_expense(message: Message, command: CommandObject) -> None:
     category = match["category"].capitalize()
     description = (match["description"] or "").strip()
     await db.add_expense(amount, category, description)
+    await asyncio.to_thread(_sync_manual)      # копия в общую таблицу для /report и /advice
     # Дублируем в Google Таблицу в фоне: ответ пользователю не ждёт сети.
     sheets_engine.schedule_append(
         date.today(), message.from_user.id, category, amount, description, "expense"
@@ -462,9 +475,39 @@ def _shot_kb(token: str, p: dict) -> InlineKeyboardMarkup:
             row = []
     if row:
         rows.append(row)
+    rows.append([InlineKeyboardButton(text="🏷 Категория", callback_data=f"shot:{token}:cm")])
     rows.append([InlineKeyboardButton(text="💾 Сохранить", callback_data=f"shot:{token}:save"),
                  InlineKeyboardButton(text="✖ Отмена", callback_data=f"shot:{token}:cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _pick_row_kb(token: str, p: dict) -> InlineKeyboardMarkup:
+    btns = [InlineKeyboardButton(text=str(i + 1), callback_data=f"shot:{token}:c{i}")
+            for i, t in enumerate(p["txns"]) if t.fingerprint not in p["dupes"]]
+    rows = [btns[i:i + 6] for i in range(0, len(btns), 6)]
+    rows.append([InlineKeyboardButton(text="← Назад", callback_data=f"shot:{token}:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _pick_cat_kb(token: str, i: int) -> InlineKeyboardMarkup:
+    cats = nz.all_categories()
+    btns = [InlineKeyboardButton(text=c, callback_data=f"shot:{token}:s{i}-{k}") for k, c in enumerate(cats)]
+    btns.append(InlineKeyboardButton(text="↔ Свой перевод", callback_data=f"shot:{token}:s{i}-{len(cats)}"))
+    rows = [btns[j:j + 2] for j in range(0, len(btns), 2)]
+    rows.append([InlineKeyboardButton(text="← Назад", callback_data=f"shot:{token}:cm")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _apply_category(t, k: int) -> None:
+    cats = nz.all_categories()
+    if k >= len(cats):                      # «Свой перевод»: не расход и не доход
+        t.type, t.category = "transfer", ""
+        return
+    t.category = cats[k]
+    if t.type in ("transfer", "p2p_out", "family_out", "unknown"):
+        t.type = "expense"
+    elif t.type in ("p2p_in", "family_in"):
+        t.type = "income"
 
 
 def _process_shot(path: str) -> tuple[list, set]:
@@ -524,7 +567,7 @@ async def on_shot_button(cb: CallbackQuery) -> None:
     if _allowed and cb.from_user.id not in _allowed:
         await cb.answer()
         return
-    _, token, action = cb.data.split(":")
+    _, token, action = cb.data.split(":", 2)
     p = _pending_shots.get(token)
     if not p or p["user"] != cb.from_user.id:
         await cb.answer("Этот список уже закрыт. Пришлите скриншот заново.", show_alert=True)
@@ -541,6 +584,20 @@ async def on_shot_button(cb: CallbackQuery) -> None:
                                               abs(t.amount_kop) / 100, f"{t.merchant} (скриншот)", SHEET_TYPES[t.type])
         await cb.message.edit_text(f"Сохранено операций: {len(keep)}."
                                    + (" Записала и в Google Таблицу." if sheets_engine.is_enabled() else ""))
+    elif action == "cm":
+        await cb.message.edit_text(_shot_text(p) + "\n\n<b>У какой строки сменить категорию?</b>",
+                                   reply_markup=_pick_row_kb(token, p))
+    elif action == "back":
+        await cb.message.edit_text(_shot_text(p), reply_markup=_shot_kb(token, p))
+    elif action.startswith("c") and action[1:].isdigit():
+        i = int(action[1:])
+        t = p["txns"][i]
+        await cb.message.edit_text(f"{i + 1}. {escape(t.merchant)} · <b>{_ru(t.amount_kop)}</b>\nВыберите категорию:",
+                                   reply_markup=_pick_cat_kb(token, i))
+    elif action.startswith("s") and "-" in action:
+        i, k = (int(x) for x in action[1:].split("-"))
+        _apply_category(p["txns"][i], k)
+        await cb.message.edit_text(_shot_text(p), reply_markup=_shot_kb(token, p))
     elif action.startswith("x"):
         i = int(action[1:])
         p["removed"] ^= {i}
@@ -556,6 +613,9 @@ async def main() -> None:
         raise RuntimeError("Не задан BOT_TOKEN. Скопируйте .env.example в .env и укажите токен.")
 
     await db.init_db()
+    moved = await asyncio.to_thread(_sync_manual)
+    if moved:
+        log.info("Ручные траты скопированы в общую таблицу: %s", moved)
     if sheets_engine.is_enabled():
         log.info("Google Sheets: запись в таблицу «%s» включена", os.getenv("GOOGLE_SPREADSHEET_NAME"))
     else:

@@ -94,6 +94,16 @@ def categorize(merchant: str, mcc: str = "", bank_category: str = "") -> str:
     return "Прочее"
 
 
+def all_categories() -> list[str]:
+    """Известные категории (для выбора в боте)."""
+    cats = {c for _, c in RULES} | set(MCC.values()) | set(SBER_CATEGORY.values())
+    cats |= {c for _, c in config.load().get("extra_rules", [])}
+    cats |= set(config.load().get("category_aliases", {}).values())
+    cats |= {"Прочее", "Развлечения", "Проценты и комиссии"}
+    cats.discard("Чаевые (получено)")
+    return sorted(cats)
+
+
 @dataclass
 class Txn:
     source: str

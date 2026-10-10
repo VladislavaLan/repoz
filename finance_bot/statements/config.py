@@ -6,6 +6,7 @@
   extra_rules     [["REGEX", "Категория"], ...] — свои правила по названию магазина, проверяются первыми
   analysis_start  дата начала анализа по умолчанию, YYYY-MM-DD
   people          "Имя Ф." как показывает банк -> "own" / "family" (переводы со скриншотов)
+  category_aliases  {"Еда": "Продукты"} — как называть категории, введённые вручную в /add_expense
   big_purchase    порог «крупной разовой покупки» в рублях
 """
 
@@ -16,7 +17,7 @@ import os
 from functools import lru_cache
 from pathlib import Path
 
-DEFAULTS: dict = {"phones": {}, "extra_rules": [], "analysis_start": None, "big_purchase": 20000}
+DEFAULTS: dict = {"phones": {}, "people": {}, "category_aliases": {}, "extra_rules": [], "analysis_start": None, "big_purchase": 20000}
 
 
 @lru_cache(maxsize=1)

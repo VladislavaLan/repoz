@@ -21,6 +21,7 @@ from . import config
 from . import normalize as nz
 
 SOURCE = "screenshot"
+TEMP_SOURCES = ("screenshot", "manual")      # предварительные данные: выписка точнее и заменяет их
 
 MONTHS = {
     "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
@@ -173,17 +174,18 @@ def find_statement_dupes(conn: sqlite3.Connection, txns: list[nz.Txn]) -> set[st
     dup = set()
     for t in txns:
         lo, hi = (t.date - timedelta(days=1)).isoformat(), (t.date + timedelta(days=1)).isoformat()
-        if conn.execute("SELECT 1 FROM transactions WHERE source != ? AND amount_kop = ? AND date BETWEEN ? AND ? "
-                        "LIMIT 1", (SOURCE, t.amount_kop, lo, hi)).fetchone():
+        if conn.execute("SELECT 1 FROM transactions WHERE source != ? AND type != 'duplicate' AND amount_kop = ? "
+                        "AND date BETWEEN ? AND ? LIMIT 1", (SOURCE, t.amount_kop, lo, hi)).fetchone():
             dup.add(t.fingerprint)
     return dup
 
 
 def drop_screenshot_dupes(conn: sqlite3.Connection) -> int:
-    """Удаляет строки из скриншотов, которые теперь есть в выписках. Возвращает, сколько удалено."""
+    """Помечает строки из скриншотов и ручных трат, которые теперь есть в выписках (type='duplicate').
+    Строки не удаляются, чтобы ручная трата не копировалась из expenses повторно. Возвращает, сколько помечено."""
     cur = conn.execute(
-        "DELETE FROM transactions WHERE source = ? AND EXISTS (SELECT 1 FROM transactions s WHERE s.source != ? "
-        "AND s.amount_kop = transactions.amount_kop AND ABS(julianday(s.date) - julianday(transactions.date)) <= 1)",
-        (SOURCE, SOURCE))
+        "UPDATE transactions SET type = 'duplicate' WHERE source IN ('screenshot', 'manual') "
+        "AND type != 'duplicate' AND EXISTS (SELECT 1 FROM transactions s WHERE s.source NOT IN ('screenshot', 'manual') "
+        "AND s.amount_kop = transactions.amount_kop AND ABS(julianday(s.date) - julianday(transactions.date)) <= 1)")
     conn.commit()
     return cur.rowcount
