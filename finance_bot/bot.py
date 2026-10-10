@@ -32,7 +32,7 @@ import database as db  # noqa: E402
 import sheets_engine  # noqa: E402
 from chart_engine import build_month_chart  # noqa: E402
 from debt_engine import avalanche_savings  # noqa: E402
-from statements import insights, manual, screenshot  # noqa: E402
+from statements import insights, manual, screenshot, sheets_export  # noqa: E402
 from statements import normalize as nz  # noqa: E402
 from statements.importer import write as write_txns  # noqa: E402
 from statements.report import build_report, default_start, format_telegram  # noqa: E402
@@ -86,6 +86,7 @@ HELP_TEXT = (
     "/stats — диаграмма расходов за текущий месяц\n"
     "/report <code>[ГГГГ-ММ-ДД]</code> — отчёт по загруженным банковским выпискам\n"
     "📷 Пришлите скриншот истории операций из банка — я распознаю его и предложу сохранить\n"
+    "/sheet — выгрузить операции из выписок в Google Таблицу (вкладки «Выписки» и «Итоги по месяцам»)\n"
     "/advice <code>[ГГГГ-ММ-ДД]</code> — комментарии и советы по тратам (с ключом Gemini — и от нейросети)\n\n"
     "<b>Долги</b>\n"
     "/add_debt — добавить долг (пошаговый диалог)\n"
@@ -507,6 +508,33 @@ async def cmd_report(message: Message, command: CommandObject) -> None:
     await message.answer(text)
 
 
+# ---------- /sheet (выгрузка в Google Таблицу) ----------
+
+def _export_sheet() -> dict:
+    spreadsheet = sheets_engine.get_spreadsheet()
+    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        return sheets_export.export(conn, spreadsheet)
+    finally:
+        conn.close()
+
+
+@router.message(Command("sheet"))
+async def cmd_sheet(message: Message) -> None:
+    if not sheets_engine.is_enabled():
+        await message.answer("Google Таблица не подключена (нет credentials.json или GOOGLE_SPREADSHEET_NAME в .env).")
+        return
+    wait = await message.answer("Выгружаю операции в Google Таблицу…")
+    try:
+        r = await asyncio.to_thread(_export_sheet)
+    except Exception as e:
+        log.exception("Выгрузка в Google Таблицу не удалась")
+        await wait.edit_text(f"Не получилось: {escape(type(e).__name__)}. Подробности в окне бота.")
+        return
+    await wait.edit_text(f"✅ Готово. Вкладка «{sheets_export.DETAIL_TAB}»: {r['detail_rows']} операций, "
+                         f"вкладка «{sheets_export.SUMMARY_TAB}» обновлена.")
+
+
 # ---------- /advice (комментарии и рекомендации) ----------
 
 def _advice_parts(start: str) -> tuple[list[str], dict] | None:
@@ -742,6 +770,7 @@ async def main() -> None:
         BotCommand(command="add_expense", description="Записать расход"),
         BotCommand(command="stats", description="Диаграмма расходов за месяц"),
         BotCommand(command="report", description="Отчёт по банковским выпискам"),
+        BotCommand(command="sheet", description="Выгрузить операции в Google Таблицу"),
         BotCommand(command="advice", description="Комментарии и советы по тратам"),
         BotCommand(command="add_debt", description="Добавить долг"),
         BotCommand(command="debts", description="Долги и план «Лавина»"),
