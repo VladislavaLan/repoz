@@ -16,7 +16,7 @@ import urllib.error
 import urllib.request
 from collections import defaultdict
 
-from .report import build_report, rub
+from .report import build_report, planned_set, rub
 
 SUBSCRIPTION_CATS = {"Связь и подписки", "Дом и ЖКХ"}
 DEFAULT_MODEL = "gemini-2.5-flash"
@@ -29,16 +29,17 @@ def build_insights(conn: sqlite3.Connection, start: str | None = None) -> dict |
         return None
     full = rep["full_months"]
     rows = conn.execute(
-        "SELECT date, category, merchant, amount_kop, subtype, type FROM transactions "
+        "SELECT date, category, merchant, amount_kop, subtype, type, fingerprint FROM transactions "
         "WHERE date >= ? AND type IN ('expense','refund')",
         (rep["start"],),
     ).fetchall()
     cat_m: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     merch_m: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
-    cats_of = {m: c for _, c, m, _, _, _ in rows}
-    for d, cat, merchant, kop, sub, typ in rows:
+    cats_of = {m: c for _, c, m, _, _, _, _ in rows}
+    planned = planned_set(conn)
+    for d, cat, merchant, kop, sub, typ, fp in rows:
         a = -kop / 100.0
-        if typ == "expense" and a >= rep["big_limit"]:
+        if typ == "expense" and (a >= rep["big_limit"] or fp in planned):
             continue                    # крупные разовые покупки сравниваем отдельно, иначе они забивают всё
         cat_m[cat or "Прочее"][d[:7]] += a
         if merchant and a > 0 and sub != "interest":

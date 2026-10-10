@@ -12,7 +12,7 @@ from decimal import Decimal
 
 from statements import alfa, config, sber
 from statements import normalize as nz
-from statements import insights, manual, screenshot, sheets_export
+from statements import insights, manual, recat, screenshot, sheets_export
 from statements.importer import dedupe, write
 from statements.report import build_report, format_telegram
 
@@ -335,3 +335,53 @@ class SheetsExport(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Recategorize(unittest.TestCase):
+    def _conn(self):
+        conn = sqlite3.connect(":memory:")
+        rows = [
+            nz.Txn("s", "o1", date(2026, 9, 1), None, -150_000, "expense", "Покупки", "OZON RU", ""),
+            nz.Txn("s", "o2", date(2026, 9, 5), None, -250_000, "expense", "Покупки", "OZON RU", ""),
+            nz.Txn("s", "o3", date(2026, 9, 9), None, -90_000, "expense", "Покупки", "OZON FRESH", ""),
+            nz.Txn("s", "k1", date(2026, 9, 7), None, -500_000, "expense", "Здоровье", "KLINIKA", ""),
+            nz.Txn("s", "in", date(2026, 9, 2), None, 9_000_000, "income", "Зарплата", "", ""),
+        ]
+        write(conn, rows)
+        return conn, rows
+
+    def test_find_and_top(self):
+        conn, _ = self._conn()
+        found = recat.find_ops(conn, "ozon", "2026-09-01")
+        self.assertEqual([o["fingerprint"] for o in found], [r.fingerprint for r in (self._conn()[1][2], self._conn()[1][1], self._conn()[1][0])])
+        top = recat.top_merchants(conn, "Покупки", "2026-09-01")
+        self.assertEqual(top[0][0], "OZON RU")
+        self.assertAlmostEqual(top[0][1], 4000.0)
+
+    def test_override_survives_reimport(self):
+        conn, rows = self._conn()
+        recat.set_category(conn, [rows[0].fingerprint], "Продукты")
+        write(conn, rows)                               # повторная загрузка выписки сбрасывает категорию...
+        recat.apply_overrides(conn)                     # ...а правки возвращают её
+        cat = conn.execute("SELECT category FROM transactions WHERE fingerprint = ?", (rows[0].fingerprint,)).fetchone()[0]
+        self.assertEqual(cat, "Продукты")
+
+    def test_merchant_rule_applies_to_history_and_future(self):
+        conn, rows = self._conn()
+        recat.add_rule(conn, "ozon fresh", "Продукты")
+        self.assertEqual(conn.execute("SELECT category FROM transactions WHERE fingerprint = ?", (rows[2].fingerprint,)).fetchone()[0], "Продукты")
+        write(conn, rows)
+        recat.apply_overrides(conn)
+        self.assertEqual(conn.execute("SELECT category FROM transactions WHERE fingerprint = ?", (rows[2].fingerprint,)).fetchone()[0], "Продукты")
+
+    def test_planned_is_excluded_from_no_big_figures(self):
+        conn, rows = self._conn()
+        rep0 = build_report(conn, "2026-09-01", big_limit=1_000_000)
+        self.assertEqual(rep0["big"], [])
+        recat.set_planned(conn, [rows[3].fingerprint], True)
+        rep = build_report(conn, "2026-09-01", big_limit=1_000_000)
+        self.assertEqual(len(rep["big"]), 1)
+        health = next(c for c in rep["cats"] if c["category"] == "Здоровье")
+        self.assertAlmostEqual(health["total"], 5000.0)
+        self.assertAlmostEqual(health["no_big_total"], 0.0)
+        self.assertIn("плановые", format_telegram(rep))

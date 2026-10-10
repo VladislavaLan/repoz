@@ -42,6 +42,13 @@ def _has_table(conn: sqlite3.Connection, name: str) -> bool:
     return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
 
 
+def planned_set(conn: sqlite3.Connection) -> set[str]:
+    """Отпечатки операций, помеченных как плановые (/recat): они считаются отдельно, как крупные разовые."""
+    if not _has_table(conn, "tx_overrides"):
+        return set()
+    return {r[0] for r in conn.execute("SELECT fingerprint FROM tx_overrides WHERE planned = 1")}
+
+
 def build_report(conn: sqlite3.Connection, start: str | None = None, big_limit: int | None = None) -> dict | None:
     """Считает отчёт с даты start. Возвращает None, если за период нет операций."""
     start = start or default_start()
@@ -49,7 +56,7 @@ def build_report(conn: sqlite3.Connection, start: str | None = None, big_limit: 
     if not _has_table(conn, "transactions"):
         return None
     rows = conn.execute(
-        "SELECT date, type, amount_kop, category, merchant, subtype FROM transactions WHERE date >= ?", (start,)
+        "SELECT date, type, amount_kop, category, merchant, subtype, fingerprint FROM transactions WHERE date >= ?", (start,)
     ).fetchall()
     if not rows:
         return None
@@ -68,7 +75,8 @@ def build_report(conn: sqlite3.Connection, start: str | None = None, big_limit: 
     income_cats: dict[str, float] = defaultdict(float)
     big, merchants = [], defaultdict(lambda: [0.0, 0])
     interest = fees = 0.0
-    for d, t, kop, cat, merchant, sub in rows:
+    planned = planned_set(conn)
+    for d, t, kop, cat, merchant, sub, fp in rows:
         a = kop / 100.0
         mon = d[:7]
         if t in ("expense", "refund"):
@@ -79,8 +87,8 @@ def build_report(conn: sqlite3.Connection, start: str | None = None, big_limit: 
                 interest -= a
             elif sub == "fee":
                 fees -= a
-            if t == "expense" and -a >= big_limit:
-                big.append((d, -a, cat, merchant))
+            if t == "expense" and (-a >= big_limit or fp in planned):
+                big.append((d, -a, cat or "Прочее", merchant))
             elif t == "expense" and merchant:
                 merchants[merchant][0] -= a
                 merchants[merchant][1] += 1
@@ -112,9 +120,13 @@ def build_report(conn: sqlite3.Connection, start: str | None = None, big_limit: 
     for c, d in sorted(cats.items(), key=lambda kv: -kv[1]["total"]):
         full_sum = sum(d[m] for m in full)
         big_c = sum(a for dd, a, cc, _ in big if cc == c and dd[:7] in full)
+        big_all = sum(a for _, a, cc, _ in big if cc == c)
+        rest_total = spend_total - big_sum
         cat_rows.append({
             "category": c, "total": d["total"],
             "share": d["total"] / spend_total * 100 if spend_total else 0.0,
+            "no_big_total": d["total"] - big_all,
+            "no_big_share": (d["total"] - big_all) / rest_total * 100 if rest_total > 0 else 0.0,
             "per_month": full_sum / n_full if n_full else None,
             "per_month_no_big": (full_sum - big_c) / n_full if n_full else None,
         })
@@ -145,7 +157,8 @@ def format_telegram(r: dict) -> str:
         f"Траты (с учётом возвратов): <b>{rub(t['spend'])}</b>",
     ]
     if r["big"]:
-        lines.append(f"   из них крупные разовые (от {rub(r['big_limit'])}): {rub(r['big_sum'])}, {len(r['big'])} шт.")
+        lines.append(f"   из них крупные и плановые (от {rub(r['big_limit'])} или с пометкой): "
+                     f"{rub(r['big_sum'])}, {len(r['big'])} шт.")
     lines.append(f"Переводы людям (чистые): {rub(t['p2p'])} · семье (чистые): {rub(t['family'])}")
     if r["full_months"]:
         fm = r["full_months"]
@@ -154,9 +167,10 @@ def format_telegram(r: dict) -> str:
             f"<b>В среднем за полный месяц</b> ({fm[0]} … {fm[-1]}):",
             f"доход {rub(a['income'])} · траты {rub(a['spend'])} · без крупных {rub(r['avg_spend_no_big'])}",
         ]
-    lines += ["", "<b>По категориям:</b>"]
+    lines += ["", "<b>По категориям</b> (всего · без крупных и плановых):"]
     for c in r["cats"][:9]:
-        lines.append(f"• {escape(c['category'])}: {rub(c['total'])} ({c['share']:.0f}%)")
+        tail = f" · {rub(c['no_big_total'])} ({c['no_big_share']:.0f}%)" if r["big"] else ""
+        lines.append(f"• {escape(c['category'])}: {rub(c['total'])} ({c['share']:.0f}%){tail}")
     if r["interest"] or r["fees"]:
         lines += ["", f"Проценты по кредитке: {rub(r['interest'])} · комиссии: {rub(r['fees'])}"]
     return "\n".join(lines)

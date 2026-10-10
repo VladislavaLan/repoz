@@ -32,7 +32,7 @@ import database as db  # noqa: E402
 import sheets_engine  # noqa: E402
 from chart_engine import build_month_chart  # noqa: E402
 from debt_engine import avalanche_savings  # noqa: E402
-from statements import insights, manual, screenshot, sheets_export  # noqa: E402
+from statements import insights, manual, recat, screenshot, sheets_export  # noqa: E402
 from statements import normalize as nz  # noqa: E402
 from statements.importer import write as write_txns  # noqa: E402
 from statements.report import build_report, default_start, format_telegram  # noqa: E402
@@ -86,6 +86,8 @@ HELP_TEXT = (
     "/stats — диаграмма расходов за текущий месяц\n"
     "/report <code>[ГГГГ-ММ-ДД]</code> — отчёт по загруженным банковским выпискам\n"
     "📷 Пришлите скриншот истории операций из банка — я распознаю его и предложу сохранить\n"
+    "/top <code>[категория]</code> — какие магазины в категории (без названия — в «Прочее»)\n"
+    "/recat <code>озон</code> — поправить категории у операций магазина, отметить плановые траты\n"
     "/sheet — выгрузить операции из выписок в Google Таблицу (вкладки «Выписки» и «Итоги по месяцам»)\n"
     "/advice <code>[ГГГГ-ММ-ДД]</code> — комментарии и советы по тратам (с ключом Gemini — и от нейросети)\n\n"
     "<b>Долги</b>\n"
@@ -535,6 +537,222 @@ async def cmd_sheet(message: Message) -> None:
                          f"вкладка «{sheets_export.SUMMARY_TAB}» обновлена.")
 
 
+# ---------- /top и /recat (ручная правка категорий) ----------
+
+_recat_sessions: dict[str, dict] = {}
+_RC_PAGE = 8
+
+
+def _db_call(fn, *args):
+    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        return fn(conn, *args)
+    finally:
+        conn.close()
+
+
+def _rc_text(p: dict) -> str:
+    ops, page = p["ops"], p["page"]
+    pages = max(1, -(-len(ops) // _RC_PAGE))
+    lines = [f"<b>«{escape(p['query'])}»</b> · операций: {len(ops)} · стр. {page + 1}/{pages}",
+             "Отметьте операции кнопками с номерами, потом выберите действие.", ""]
+    for i in range(page * _RC_PAGE, min(len(ops), (page + 1) * _RC_PAGE)):
+        o = ops[i]
+        mark = "✅" if i in p["sel"] else "▫️"
+        plan = " 📌" if o["planned"] else ""
+        lines.append(f"{mark} {i + 1}. {o['date'][8:]}.{o['date'][5:7]} · {_ru(-o['kop'])} · "
+                     f"{escape(o['category'])}{plan}")
+    if p["sel"]:
+        lines += ["", f"Отмечено: {len(p['sel'])} на {_ru(-sum(ops[i]['kop'] for i in p['sel']))}"]
+    return "\n".join(lines)
+
+
+def _rc_kb(token: str, p: dict) -> InlineKeyboardMarkup:
+    ops, page = p["ops"], p["page"]
+    idx = range(page * _RC_PAGE, min(len(ops), (page + 1) * _RC_PAGE))
+    nums = [InlineKeyboardButton(text=("✅" if i in p["sel"] else "") + str(i + 1), callback_data=f"rc:{token}:t{i}") for i in idx]
+    rows = [nums[j:j + 4] for j in range(0, len(nums), 4)]
+    rows.append([InlineKeyboardButton(text="Все на странице", callback_data=f"rc:{token}:sa"),
+                 InlineKeyboardButton(text="Все найденные", callback_data=f"rc:{token}:sall"),
+                 InlineKeyboardButton(text="Сбросить", callback_data=f"rc:{token}:sx")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀", callback_data=f"rc:{token}:pp"))
+    if (page + 1) * _RC_PAGE < len(ops):
+        nav.append(InlineKeyboardButton(text="▶", callback_data=f"rc:{token}:pn"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🏷 Категория отмеченным", callback_data=f"rc:{token}:cm")])
+    rows.append([InlineKeyboardButton(text="📌 Плановая трата вкл/выкл", callback_data=f"rc:{token}:pl")])
+    rows.append([InlineKeyboardButton(text="🏪 Правило для всех такого магазина", callback_data=f"rc:{token}:rm")])
+    rows.append([InlineKeyboardButton(text="Закрыть", callback_data=f"rc:{token}:cl")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _rc_cat_kb(token: str) -> InlineKeyboardMarkup:
+    cats = nz.all_categories()
+    btns = [InlineKeyboardButton(text=c, callback_data=f"rc:{token}:k{k}") for k, c in enumerate(cats)]
+    rows = [btns[j:j + 2] for j in range(0, len(btns), 2)]
+    rows.append([InlineKeyboardButton(text="← Назад", callback_data=f"rc:{token}:bk")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _open_recat(target: Message, user_id: int, query: str, edit: bool = False) -> None:
+    ops = await asyncio.to_thread(_db_call, recat.find_ops, query)
+    if not ops:
+        text = f"Не нашла трат со словом «{escape(query)}» с {_d_iso(default_start())}."
+        await (target.edit_text(text) if edit else target.answer(text))
+        return
+    token = uuid.uuid4().hex[:8]
+    p = {"user": user_id, "query": query, "ops": ops, "sel": set(), "page": 0, "mode": "sel"}
+    _recat_sessions[token] = p
+    if edit:
+        await target.edit_text(_rc_text(p), reply_markup=_rc_kb(token, p))
+    else:
+        await target.answer(_rc_text(p), reply_markup=_rc_kb(token, p))
+
+
+def _d_iso(iso: str) -> str:
+    return f"{iso[8:]}.{iso[5:7]}.{iso[:4]}"
+
+
+@router.message(Command("recat"))
+async def cmd_recat(message: Message, command: CommandObject) -> None:
+    if not command.args or not command.args.strip():
+        await message.answer("Напишите часть названия магазина, например <code>/recat озон</code>.\n"
+                             "Названия, которые бот видит у вас в выписках, покажет команда /top.")
+        return
+    await _open_recat(message, message.from_user.id, command.args.strip())
+
+
+_top_sessions: dict[str, dict] = {}
+
+
+@router.message(Command("top"))
+@router.message(Command("categories"))
+async def cmd_top(message: Message, command: CommandObject) -> None:
+    cat = (command.args or "").strip() or "Прочее"
+    rows = await asyncio.to_thread(_db_call, recat.top_merchants, cat)
+    if not rows:
+        await message.answer(f"В категории «{escape(cat)}» нет трат. Названия категорий: "
+                             + ", ".join(nz.all_categories()))
+        return
+    token = uuid.uuid4().hex[:8]
+    _top_sessions[token] = {"user": message.from_user.id, "names": [m for m, _, _ in rows]}
+    lines = [f"<b>«{escape(cat)}»: крупнейшие получатели с {_d_iso(default_start())}</b>", ""]
+    lines += [f"{i + 1}. {escape(m[:40])} — {_ru(int(s * 100))} ({n} оп.)" for i, (m, s, n) in enumerate(rows)]
+    lines += ["", "Нажмите номер, чтобы разобрать магазин."]
+    btns = [InlineKeyboardButton(text=str(i + 1), callback_data=f"top:{token}:{i}") for i in range(len(rows))]
+    await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[btns[j:j + 5] for j in range(0, len(btns), 5)]))
+
+
+@router.callback_query(F.data.startswith("top:"))
+async def on_top_button(cb: CallbackQuery) -> None:
+    if _allowed and cb.from_user.id not in _allowed:
+        await cb.answer()
+        return
+    _, token, i = cb.data.split(":")
+    p = _top_sessions.get(token)
+    if not p or p["user"] != cb.from_user.id:
+        await cb.answer("Список устарел, вызовите /top ещё раз.", show_alert=True)
+        return
+    await cb.answer()
+    await _open_recat(cb.message, cb.from_user.id, p["names"][int(i)])
+
+
+def _rc_apply(kind: str, fps: list[str], arg: str) -> int:
+    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        if kind == "cat":
+            return recat.set_category(conn, fps, arg)
+        if kind == "rule":
+            return recat.add_rule(conn, arg[0], arg[1])
+        return recat.set_planned(conn, fps, arg)
+    finally:
+        conn.close()
+
+
+@router.callback_query(F.data.startswith("rc:"))
+async def on_recat_button(cb: CallbackQuery) -> None:
+    if _allowed and cb.from_user.id not in _allowed:
+        await cb.answer()
+        return
+    _, token, action = cb.data.split(":", 2)
+    p = _recat_sessions.get(token)
+    if not p or p["user"] != cb.from_user.id:
+        await cb.answer("Список устарел, вызовите команду ещё раз.", show_alert=True)
+        return
+    ops = p["ops"]
+    page_idx = range(p["page"] * _RC_PAGE, min(len(ops), (p["page"] + 1) * _RC_PAGE))
+
+    async def refresh() -> None:
+        await cb.message.edit_text(_rc_text(p), reply_markup=_rc_kb(token, p))
+
+    if action == "cl":
+        _recat_sessions.pop(token, None)
+        await cb.message.edit_text("Готово. Чтобы увидеть изменения в таблице, отправьте /sheet; в /report они уже учтены.")
+    elif action[0] == "t" and action[1:].isdigit():
+        p["sel"] ^= {int(action[1:])}
+        await refresh()
+    elif action == "sa":
+        p["sel"] |= set(page_idx)
+        await refresh()
+    elif action == "sall":
+        p["sel"] = set(range(len(ops)))
+        await refresh()
+    elif action == "sx":
+        p["sel"] = set()
+        await refresh()
+    elif action == "pp":
+        p["page"] = max(0, p["page"] - 1)
+        await refresh()
+    elif action == "pn":
+        p["page"] += 1
+        await refresh()
+    elif action == "bk":
+        await refresh()
+    elif action in ("cm", "rm"):
+        if action == "cm" and not p["sel"]:
+            await cb.answer("Сначала отметьте операции номерами.", show_alert=True)
+            return
+        p["mode"] = "sel" if action == "cm" else "rule"
+        title = (f"Категория для {len(p['sel'])} отмеченных операций:" if action == "cm"
+                 else f"Категория для ВСЕХ трат со словом «{escape(p['query'])}» (и будущих):")
+        await cb.message.edit_text(title, reply_markup=_rc_cat_kb(token))
+    elif action[0] == "k" and action[1:].isdigit():
+        cat = nz.all_categories()[int(action[1:])]
+        if p["mode"] == "rule":
+            n = await asyncio.to_thread(_rc_apply, "rule", [], (p["query"], cat))
+            await cb.message.edit_text(f"✅ Правило сохранено: всё со словом «{escape(p['query'])}» → {escape(cat)}. "
+                                       f"Изменено операций: {n}.")
+            _recat_sessions.pop(token, None)
+            await cb.answer()
+            return
+        fps = [ops[i]["fingerprint"] for i in sorted(p["sel"])]
+        await asyncio.to_thread(_rc_apply, "cat", fps, cat)
+        for i in p["sel"]:
+            ops[i]["category"] = cat
+        p["sel"] = set()
+        await refresh()
+        await cb.answer(f"Готово: {len(fps)} → {cat}")
+        return
+    elif action == "pl":
+        if not p["sel"]:
+            await cb.answer("Сначала отметьте операции номерами.", show_alert=True)
+            return
+        sel = sorted(p["sel"])
+        mark = not all(ops[i]["planned"] for i in sel)       # если все уже плановые — снимаем пометку
+        await asyncio.to_thread(_rc_apply, "plan", [ops[i]["fingerprint"] for i in sel], mark)
+        for i in sel:
+            ops[i]["planned"] = mark
+        p["sel"] = set()
+        await refresh()
+        await cb.answer("Помечено как плановая трата" if mark else "Пометка снята")
+        return
+    await cb.answer()
+
+
 # ---------- /advice (комментарии и рекомендации) ----------
 
 def _advice_parts(start: str) -> tuple[list[str], dict] | None:
@@ -770,6 +988,8 @@ async def main() -> None:
         BotCommand(command="add_expense", description="Записать расход"),
         BotCommand(command="stats", description="Диаграмма расходов за месяц"),
         BotCommand(command="report", description="Отчёт по банковским выпискам"),
+        BotCommand(command="top", description="Магазины в категории (по умолчанию «Прочее»)"),
+        BotCommand(command="recat", description="Поправить категории у магазина"),
         BotCommand(command="sheet", description="Выгрузить операции в Google Таблицу"),
         BotCommand(command="advice", description="Комментарии и советы по тратам"),
         BotCommand(command="add_debt", description="Добавить долг"),
