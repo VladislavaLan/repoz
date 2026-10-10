@@ -81,8 +81,8 @@ def months_text(n: int) -> str:
 HELP_TEXT = (
     "👋 <b>Бот учёта финансов и долгов</b>\n\n"
     "<b>Расходы</b>\n"
-    "/add_expense <code>сумма категория [описание]</code> — записать расход\n"
-    "   например: <code>/add_expense 450 Еда обед в кафе</code>\n"
+    "/add_expense — записать расход (бот спросит сумму, категорию и описание)\n"
+    "   или сразу: <code>/add_expense 450 Еда обед в кафе</code>\n"
     "/stats — диаграмма расходов за текущий месяц\n"
     "/report <code>[ГГГГ-ММ-ДД]</code> — отчёт по загруженным банковским выпискам\n"
     "📷 Пришлите скриншот истории операций из банка — я распознаю его и предложу сохранить\n"
@@ -126,36 +126,141 @@ def _sync_manual() -> int:
         conn.close()
 
 
+async def _save_expense(user_id: int, amount: float, category: str, description: str) -> str:
+    """Записывает расход (база + общая таблица + Google Таблица). Возвращает текст подтверждения."""
+    await db.add_expense(amount, category, description)
+    await asyncio.to_thread(_sync_manual)      # копия в общую таблицу для /report и /advice
+    # Дублируем в Google Таблицу в фоне: ответ пользователю не ждёт сети.
+    sheets_engine.schedule_append(date.today(), user_id, category, amount, description, "expense")
+    text = f"✅ Записал расход: <b>{money(amount)}</b> — {escape(category)}"
+    if description:
+        text += f" ({escape(description)})"
+    return text
+
+
+class AddExpense(StatesGroup):
+    amount = State()
+    category = State()
+    description = State()
+
+
+DEFAULT_CATEGORIES = ["Продукты", "Кафе и рестораны", "Транспорт", "Покупки", "Здоровье", "Развлечения",
+                      "Связь и подписки", "Дом и ЖКХ"]
+
+
+def _category_choices() -> list[str]:
+    """Сначала твои частые категории из ручных трат, потом стандартные."""
+    out: list[str] = []
+    try:
+        conn = sqlite3.connect(db.DB_PATH)
+        try:
+            for (c,) in conn.execute("SELECT category FROM expenses GROUP BY category ORDER BY COUNT(*) DESC LIMIT 6"):
+                if c not in out:
+                    out.append(c)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        pass
+    for c in DEFAULT_CATEGORIES:
+        if c not in out and len(out) < 10:
+            out.append(c)
+    return out
+
+
 @router.message(Command("add_expense"))
-async def cmd_add_expense(message: Message, command: CommandObject) -> None:
-    usage = "Формат: <code>/add_expense сумма категория [описание]</code>\nНапример: <code>/add_expense 450 Еда обед</code>"
-    if not command.args:
-        await message.answer(usage)
+async def cmd_add_expense(message: Message, command: CommandObject, state: FSMContext) -> None:
+    if not command.args:                       # из меню: задаём вопросы по шагам
+        await state.clear()
+        await state.set_state(AddExpense.amount)
+        await message.answer("💸 Сколько потратили? Напишите сумму, например <code>450</code>.\n"
+                             "Можно сразу всё: <code>450 Еда обед</code>. /cancel — отмена.")
         return
 
     match = EXPENSE_RE.match(command.args)
     if not match:
-        await message.answer(f"Не понял запись.\n{usage}")
+        await message.answer("Не понял запись. Пример: <code>/add_expense 450 Еда обед</code>\n"
+                             "Или просто отправьте /add_expense и ответьте на вопросы.")
         return
-
     amount = parse_number(match["amount"])
     if amount <= 0:
         await message.answer("Сумма должна быть больше нуля.")
         return
+    await state.clear()
+    await message.answer(await _save_expense(message.from_user.id, amount, match["category"].capitalize(),
+                                             (match["description"] or "").strip()))
 
-    category = match["category"].capitalize()
-    description = (match["description"] or "").strip()
-    await db.add_expense(amount, category, description)
-    await asyncio.to_thread(_sync_manual)      # копия в общую таблицу для /report и /advice
-    # Дублируем в Google Таблицу в фоне: ответ пользователю не ждёт сети.
-    sheets_engine.schedule_append(
-        date.today(), message.from_user.id, category, amount, description, "expense"
-    )
 
-    text = f"✅ Записал расход: <b>{money(amount)}</b> — {escape(category)}"
-    if description:
-        text += f" ({escape(description)})"
-    await message.answer(text)
+@router.message(AddExpense.amount, F.text, ~F.text.startswith("/"))
+async def expense_amount(message: Message, state: FSMContext) -> None:
+    text = message.text.strip()
+    full = EXPENSE_RE.match(text)
+    if full and re.search(r"[A-Za-zА-Яа-яЁё]", full["category"]):     # «450 Еда обед» одним сообщением
+        amount = parse_number(full["amount"])
+        if amount > 0:
+            await state.clear()
+            await message.answer(await _save_expense(message.from_user.id, amount, full["category"].capitalize(),
+                                                     (full["description"] or "").strip()))
+            return
+    try:
+        amount = parse_number(text)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Введите сумму числом, например <code>450</code> или <code>1 200,50</code>.")
+        return
+    cats = _category_choices()
+    await state.update_data(amount=amount, cats=cats)
+    await state.set_state(AddExpense.category)
+    rows = [[InlineKeyboardButton(text=c, callback_data=f"exp:c{i}") for i, c in enumerate(cats)][j:j + 2]
+            for j in range(0, len(cats), 2)]
+    await message.answer(f"Сумма: <b>{money(amount)}</b>. Выберите категорию кнопкой или напишите свою:",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+async def _ask_description(target: Message, state: FSMContext, category: str) -> None:
+    await state.update_data(category=category)
+    await state.set_state(AddExpense.description)
+    await target.answer(
+        f"Категория: <b>{escape(category)}</b>. Добавьте описание (например, «обед») или нажмите кнопку:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Без описания", callback_data="exp:skip")]]))
+
+
+@router.message(AddExpense.category, F.text, ~F.text.startswith("/"))
+async def expense_category_text(message: Message, state: FSMContext) -> None:
+    category = message.text.strip()[:40].capitalize()
+    await _ask_description(message, state, category)
+
+
+@router.message(AddExpense.description, F.text, ~F.text.startswith("/"))
+async def expense_description(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    await state.clear()
+    await message.answer(await _save_expense(message.from_user.id, data["amount"], data["category"],
+                                             message.text.strip()[:200]))
+
+
+@router.callback_query(F.data.startswith("exp:"))
+async def on_expense_button(cb: CallbackQuery, state: FSMContext) -> None:
+    if _allowed and cb.from_user.id not in _allowed:
+        await cb.answer()
+        return
+    data = await state.get_data()
+    action = cb.data.split(":", 1)[1]
+    if action.startswith("c") and await state.get_state() == AddExpense.category.state:
+        cats = data.get("cats", [])
+        idx = int(action[1:])
+        if idx < len(cats):
+            await cb.message.edit_reply_markup(reply_markup=None)
+            await _ask_description(cb.message, state, cats[idx])
+    elif action == "skip" and await state.get_state() == AddExpense.description.state:
+        await state.clear()
+        await cb.message.edit_reply_markup(reply_markup=None)
+        await cb.message.answer(await _save_expense(cb.from_user.id, data["amount"], data["category"], ""))
+    else:
+        await cb.answer("Этот вопрос уже закрыт. Начните заново: /add_expense", show_alert=True)
+        return
+    await cb.answer()
 
 
 # ---------- /add_debt (FSM) ----------
