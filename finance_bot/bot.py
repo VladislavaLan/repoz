@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import tempfile
+import uuid
 import logging
 import os
 import re
+import sqlite3
 from datetime import date, datetime
 from html import escape
 
@@ -20,12 +24,16 @@ from aiogram.filters import Command, CommandObject, CommandStart  # noqa: E402
 from aiogram.fsm.context import FSMContext  # noqa: E402
 from aiogram.fsm.state import State, StatesGroup  # noqa: E402
 from aiogram.fsm.storage.memory import MemoryStorage  # noqa: E402
-from aiogram.types import BotCommand, BufferedInputFile, Message  # noqa: E402
+from aiogram.types import BotCommand, BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message  # noqa: E402
 
 import database as db  # noqa: E402
 import sheets_engine  # noqa: E402
 from chart_engine import build_month_chart  # noqa: E402
 from debt_engine import avalanche_savings  # noqa: E402
+from statements import insights, manual, screenshot  # noqa: E402
+from statements import normalize as nz  # noqa: E402
+from statements.importer import write as write_txns  # noqa: E402
+from statements.report import build_report, default_start, format_telegram  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -73,7 +81,10 @@ HELP_TEXT = (
     "<b>Расходы</b>\n"
     "/add_expense <code>сумма категория [описание]</code> — записать расход\n"
     "   например: <code>/add_expense 450 Еда обед в кафе</code>\n"
-    "/stats — диаграмма расходов за текущий месяц\n\n"
+    "/stats — диаграмма расходов за текущий месяц\n"
+    "/report <code>[ГГГГ-ММ-ДД]</code> — отчёт по загруженным банковским выпискам\n"
+    "📷 Пришлите скриншот истории операций из банка — я распознаю его и предложу сохранить\n"
+    "/advice <code>[ГГГГ-ММ-ДД]</code> — комментарии и советы по тратам (с ключом Gemini — и от нейросети)\n\n"
     "<b>Долги</b>\n"
     "/add_debt — добавить долг (пошаговый диалог)\n"
     "/debts — список долгов и порядок погашения по «Лавине»\n"
@@ -102,6 +113,17 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
 
 # ---------- /add_expense ----------
 
+def _sync_manual() -> int:
+    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        return manual.sync_manual(conn)
+    except sqlite3.Error:
+        log.exception("Не удалось скопировать ручные траты в transactions")
+        return 0
+    finally:
+        conn.close()
+
+
 @router.message(Command("add_expense"))
 async def cmd_add_expense(message: Message, command: CommandObject) -> None:
     usage = "Формат: <code>/add_expense сумма категория [описание]</code>\nНапример: <code>/add_expense 450 Еда обед</code>"
@@ -122,6 +144,7 @@ async def cmd_add_expense(message: Message, command: CommandObject) -> None:
     category = match["category"].capitalize()
     description = (match["description"] or "").strip()
     await db.add_expense(amount, category, description)
+    await asyncio.to_thread(_sync_manual)      # копия в общую таблицу для /report и /advice
     # Дублируем в Google Таблицу в фоне: ответ пользователю не ждёт сети.
     sheets_engine.schedule_append(
         date.today(), message.from_user.id, category, amount, description, "expense"
@@ -347,6 +370,241 @@ async def cmd_stats(message: Message) -> None:
     )
 
 
+# ---------- /report (банковские выписки) ----------
+
+def _report_text(start: str) -> str | None:
+    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        report = build_report(conn, start)
+    finally:
+        conn.close()
+    return format_telegram(report) if report else None
+
+
+@router.message(Command("report"))
+async def cmd_report(message: Message, command: CommandObject) -> None:
+    start = default_start()
+    if command.args:
+        try:
+            start = date.fromisoformat(command.args.strip()).isoformat()
+        except ValueError:
+            await message.answer("Формат: <code>/report [ГГГГ-ММ-ДД]</code>, например <code>/report 2026-04-01</code>")
+            return
+    text = await asyncio.to_thread(_report_text, start)
+    if text is None:
+        await message.answer(
+            "Операций из выписок за этот период нет.\n"
+            "Загрузите выписки на компьютере: <code>python import_statements.py папка_с_pdf</code>"
+        )
+        return
+    await message.answer(text)
+
+
+# ---------- /advice (комментарии и рекомендации) ----------
+
+def _advice_parts(start: str) -> tuple[list[str], dict] | None:
+    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        ins = insights.build_insights(conn, start)
+    finally:
+        conn.close()
+    if not ins:
+        return None
+    return insights.rule_comments(ins), insights.ai_summary(ins)
+
+
+@router.message(Command("advice"))
+async def cmd_advice(message: Message, command: CommandObject) -> None:
+    start = default_start()
+    if command.args:
+        try:
+            start = date.fromisoformat(command.args.strip()).isoformat()
+        except ValueError:
+            await message.answer("Формат: <code>/advice [ГГГГ-ММ-ДД]</code>")
+            return
+    parts = await asyncio.to_thread(_advice_parts, start)
+    if parts is None:
+        await message.answer("Нужен хотя бы один полный месяц операций из выписок (см. /report).")
+        return
+    comments, summary = parts
+    await message.answer("<b>Наблюдения</b>\n" + "\n".join("• " + escape(c) for c in comments))
+    if not os.getenv("GEMINI_API_KEY"):
+        await message.answer("Совет от нейросети выключен: добавьте GEMINI_API_KEY в .env (см. README).")
+        return
+    wait = await message.answer("Спрашиваю Gemini (отправляю только суммы по категориям)…")
+    try:
+        text = await asyncio.to_thread(insights.ai_advice, summary)
+    except RuntimeError as e:
+        await wait.edit_text(escape(str(e)))
+        return
+    await wait.edit_text("<b>Совет нейросети</b>\n" + escape(text))
+
+
+# ---------- Скриншоты истории операций ----------
+
+_pending_shots: dict[str, dict] = {}       # token -> {user, txns, dupes, removed}
+TYPE_LABEL = {"expense": "расход", "refund": "возврат", "income": "доход", "transfer": "между своими",
+              "p2p_out": "перевод людям", "p2p_in": "перевод от людей", "family_out": "семье", "family_in": "от семьи"}
+
+
+def _ru(kop: int) -> str:
+    return f"{kop / 100:,.2f}".replace(",", " ").replace(".", ",").replace(",00", "") + " ₽"
+
+
+def _shot_text(p: dict) -> str:
+    lines = ["<b>Нашла на скриншоте</b> (проверьте и нажмите «Сохранить»):", ""]
+    for i, t in enumerate(p["txns"]):
+        mark = "♻️" if t.fingerprint in p["dupes"] else ("➖" if i in p["removed"] else "✅")
+        what = t.category or TYPE_LABEL.get(t.type, t.type)
+        lines.append(f"{mark} {i + 1}. {t.date:%d.%m} · {escape(t.merchant)} · <b>{_ru(t.amount_kop)}</b> · {escape(what)}")
+    if p["dupes"]:
+        lines += ["", "♻️ — уже есть в базе из выписки, не сохраняю."]
+    lines += ["", "Чтобы убрать лишнюю строку, нажмите её номер."]
+    return "\n".join(lines)
+
+
+def _shot_kb(token: str, p: dict) -> InlineKeyboardMarkup:
+    rows, row = [], []
+    for i, t in enumerate(p["txns"]):
+        if t.fingerprint in p["dupes"]:
+            continue
+        row.append(InlineKeyboardButton(text=("➖" if i in p["removed"] else "✅") + str(i + 1),
+                                        callback_data=f"shot:{token}:x{i}"))
+        if len(row) == 5:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="🏷 Категория", callback_data=f"shot:{token}:cm")])
+    rows.append([InlineKeyboardButton(text="💾 Сохранить", callback_data=f"shot:{token}:save"),
+                 InlineKeyboardButton(text="✖ Отмена", callback_data=f"shot:{token}:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _pick_row_kb(token: str, p: dict) -> InlineKeyboardMarkup:
+    btns = [InlineKeyboardButton(text=str(i + 1), callback_data=f"shot:{token}:c{i}")
+            for i, t in enumerate(p["txns"]) if t.fingerprint not in p["dupes"]]
+    rows = [btns[i:i + 6] for i in range(0, len(btns), 6)]
+    rows.append([InlineKeyboardButton(text="← Назад", callback_data=f"shot:{token}:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _pick_cat_kb(token: str, i: int) -> InlineKeyboardMarkup:
+    cats = nz.all_categories()
+    btns = [InlineKeyboardButton(text=c, callback_data=f"shot:{token}:s{i}-{k}") for k, c in enumerate(cats)]
+    btns.append(InlineKeyboardButton(text="↔ Свой перевод", callback_data=f"shot:{token}:s{i}-{len(cats)}"))
+    rows = [btns[j:j + 2] for j in range(0, len(btns), 2)]
+    rows.append([InlineKeyboardButton(text="← Назад", callback_data=f"shot:{token}:cm")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _apply_category(t, k: int) -> None:
+    cats = nz.all_categories()
+    if k >= len(cats):                      # «Свой перевод»: не расход и не доход
+        t.type, t.category = "transfer", ""
+        return
+    t.category = cats[k]
+    if t.type in ("transfer", "p2p_out", "family_out", "unknown"):
+        t.type = "expense"
+    elif t.type in ("p2p_in", "family_in"):
+        t.type = "income"
+
+
+def _process_shot(path: str) -> tuple[list, set]:
+    txns = screenshot.read_screenshot(path, date.today())
+    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        return txns, screenshot.find_statement_dupes(conn, txns)
+    finally:
+        conn.close()
+
+
+def _is_image_doc(message: Message) -> bool:
+    return bool(message.document and (message.document.mime_type or "").startswith("image/"))
+
+
+@router.message(F.photo | F.func(_is_image_doc))
+async def on_screenshot(message: Message, bot: Bot) -> None:
+    file = message.photo[-1] if message.photo else message.document
+    buf = io.BytesIO()
+    await bot.download(file, destination=buf)
+    wait = await message.answer("Читаю скриншот…")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = f"{tmp}/shot.jpg"
+        with open(path, "wb") as f:
+            f.write(buf.getvalue())
+        try:
+            txns, dupes = await asyncio.to_thread(_process_shot, path)
+        except RuntimeError as e:
+            await wait.edit_text(escape(str(e)))
+            return
+    if not txns:
+        await wait.edit_text("Не нашла операций. Нужен скриншот экрана «История» с датами и суммами. "
+                             "Пришлите его как файл («без сжатия»), так текст читается лучше.")
+        return
+    token = uuid.uuid4().hex[:8]
+    p = {"user": message.from_user.id, "txns": txns, "dupes": dupes, "removed": set()}
+    _pending_shots[token] = p
+    await wait.edit_text(_shot_text(p), reply_markup=_shot_kb(token, p))
+
+
+def _save_shot(p: dict) -> list:
+    keep = [t for i, t in enumerate(p["txns"]) if i not in p["removed"] and t.fingerprint not in p["dupes"]]
+    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        write_txns(conn, keep)
+    finally:
+        conn.close()
+    return keep
+
+
+SHEET_TYPES = {"expense": "expense", "income": "income", "refund": "Возврат", "p2p_out": "Перевод людям",
+               "p2p_in": "Перевод от людей", "family_out": "Перевод семье", "family_in": "Перевод от семьи"}
+
+
+@router.callback_query(F.data.startswith("shot:"))
+async def on_shot_button(cb: CallbackQuery) -> None:
+    if _allowed and cb.from_user.id not in _allowed:
+        await cb.answer()
+        return
+    _, token, action = cb.data.split(":", 2)
+    p = _pending_shots.get(token)
+    if not p or p["user"] != cb.from_user.id:
+        await cb.answer("Этот список уже закрыт. Пришлите скриншот заново.", show_alert=True)
+        return
+    if action == "cancel":
+        _pending_shots.pop(token, None)
+        await cb.message.edit_text("Отменено, ничего не сохранено.")
+    elif action == "save":
+        _pending_shots.pop(token, None)
+        keep = await asyncio.to_thread(_save_shot, p)
+        for t in keep:
+            if t.type in SHEET_TYPES:
+                sheets_engine.schedule_append(t.date, cb.from_user.id, t.category or TYPE_LABEL.get(t.type, ""),
+                                              abs(t.amount_kop) / 100, f"{t.merchant} (скриншот)", SHEET_TYPES[t.type])
+        await cb.message.edit_text(f"Сохранено операций: {len(keep)}."
+                                   + (" Записала и в Google Таблицу." if sheets_engine.is_enabled() else ""))
+    elif action == "cm":
+        await cb.message.edit_text(_shot_text(p) + "\n\n<b>У какой строки сменить категорию?</b>",
+                                   reply_markup=_pick_row_kb(token, p))
+    elif action == "back":
+        await cb.message.edit_text(_shot_text(p), reply_markup=_shot_kb(token, p))
+    elif action.startswith("c") and action[1:].isdigit():
+        i = int(action[1:])
+        t = p["txns"][i]
+        await cb.message.edit_text(f"{i + 1}. {escape(t.merchant)} · <b>{_ru(t.amount_kop)}</b>\nВыберите категорию:",
+                                   reply_markup=_pick_cat_kb(token, i))
+    elif action.startswith("s") and "-" in action:
+        i, k = (int(x) for x in action[1:].split("-"))
+        _apply_category(p["txns"][i], k)
+        await cb.message.edit_text(_shot_text(p), reply_markup=_shot_kb(token, p))
+    elif action.startswith("x"):
+        i = int(action[1:])
+        p["removed"] ^= {i}
+        await cb.message.edit_text(_shot_text(p), reply_markup=_shot_kb(token, p))
+    await cb.answer()
+
+
 # ---------- Запуск ----------
 
 async def main() -> None:
@@ -355,6 +613,9 @@ async def main() -> None:
         raise RuntimeError("Не задан BOT_TOKEN. Скопируйте .env.example в .env и укажите токен.")
 
     await db.init_db()
+    moved = await asyncio.to_thread(_sync_manual)
+    if moved:
+        log.info("Ручные траты скопированы в общую таблицу: %s", moved)
     if sheets_engine.is_enabled():
         log.info("Google Sheets: запись в таблицу «%s» включена", os.getenv("GOOGLE_SPREADSHEET_NAME"))
     else:
@@ -368,6 +629,8 @@ async def main() -> None:
         BotCommand(command="start", description="Приветствие и меню"),
         BotCommand(command="add_expense", description="Записать расход"),
         BotCommand(command="stats", description="Диаграмма расходов за месяц"),
+        BotCommand(command="report", description="Отчёт по банковским выпискам"),
+        BotCommand(command="advice", description="Комментарии и советы по тратам"),
         BotCommand(command="add_debt", description="Добавить долг"),
         BotCommand(command="debts", description="Долги и план «Лавина»"),
         BotCommand(command="cancel", description="Отменить диалог"),

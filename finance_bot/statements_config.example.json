@@ -1,0 +1,24 @@
+{
+  "phones": {
+    "1111": "own",
+    "2222": "family"
+  },
+  "extra_rules": [
+    [
+      "MY LOCAL CAFE",
+      "Кафе и рестораны"
+    ],
+    [
+      "MY GYM",
+      "Здоровье"
+    ]
+  ],
+  "analysis_start": "2026-01-01",
+  "big_purchase": 20000,
+  "people": {
+    "Иван П.": "family"
+  },
+  "category_aliases": {
+    "Еда": "Продукты"
+  }
+}

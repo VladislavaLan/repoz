@@ -3,3 +3,10 @@
 __pycache__/
 .venv/
 credentials.json
+# банковские выписки и данные из них — только локально
+statements_data/
+*.pdf
+*.csv
+statements_config.json
+*.db.bak-*
+*.bak-*

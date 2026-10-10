@@ -8,6 +8,8 @@ from datetime import date
 
 import aiosqlite
 
+from statements.schema import TRANSACTIONS_SCHEMA
+
 DB_PATH = os.getenv("DB_PATH", "finance.db")
 
 SCHEMA = """
@@ -29,7 +31,7 @@ CREATE TABLE IF NOT EXISTS debts (
 );
 
 CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses (date);
-"""
+""" + TRANSACTIONS_SCHEMA
 
 
 @dataclass(slots=True)
