@@ -133,6 +133,9 @@ def from_alfa(ops, source: str) -> list[Txn]:
         k = o.kind
         if k == "card_expense":
             t.type, t.category = "expense", categorize(o.merchant, o.mcc)
+        elif k == "card_refund" and re.search(r"CLOUDTIPS", o.merchant, re.IGNORECASE):
+            # выплата полученных чаевых на карту — это доход, а не возврат покупки
+            t.type, t.category = "income", "Чаевые (получено)"
         elif k == "card_refund":
             t.type, t.category = "refund", categorize(o.merchant, o.mcc)
         elif k == "payment":

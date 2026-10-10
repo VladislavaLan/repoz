@@ -50,6 +50,15 @@ class AlfaRows(unittest.TestCase):
         self.assertEqual(self._op("Операция по карте: 1++++++1111, дата совершения операции: 03.01.26, "
                                   "место совершения операции: 1\\RU\\X\\SHOP MCC5411", "20").kind, "card_refund")
 
+    def test_cloudtips_payout_is_income_not_refund(self):
+        raw = ("Операция по карте: 1++++++1111, на сумму: 935.00 RUR, дата совершения операции: 01.04.26, "
+               "место совершения операции: 25030184\\RU\\CloudTips Online 8398>Moskva MCC7399")
+        op = self._op(raw, "935.00")
+        t = nz.from_alfa([op], "alfa_0000")[0]
+        self.assertEqual((t.type, t.category), ("income", "Чаевые (получено)"))
+        shop = self._op(raw.replace("CloudTips Online 8398>Moskva", "OZON RU"), "935.00")
+        self.assertEqual(nz.from_alfa([shop], "alfa_0000")[0].type, "refund")
+
     def test_phone_last4(self):
         op = self._op("Перевод C1 через Систему быстрых платежей на +7 (911) 000-11-22. Без НДС.", "-5")
         self.assertEqual(op.counterparty_last4, "1122")
