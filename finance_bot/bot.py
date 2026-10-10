@@ -19,6 +19,8 @@ load_dotenv()  # до импорта database, чтобы подхватить D
 
 from aiogram import Bot, Dispatcher, F, Router  # noqa: E402
 from aiogram.client.default import DefaultBotProperties  # noqa: E402
+from aiogram.client.session.aiohttp import AiohttpSession  # noqa: E402
+from aiogram.exceptions import TelegramUnauthorizedError  # noqa: E402
 from aiogram.enums import ParseMode  # noqa: E402
 from aiogram.filters import Command, CommandObject, CommandStart  # noqa: E402
 from aiogram.fsm.context import FSMContext  # noqa: E402
@@ -621,11 +623,16 @@ async def main() -> None:
     else:
         log.info("Google Sheets выключен (нет GOOGLE_SPREADSHEET_NAME или credentials.json)")
 
-    bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    # Если Telegram не открывается напрямую, укажите прокси в .env: TELEGRAM_PROXY=socks5://127.0.0.1:1080
+    proxy = os.getenv("TELEGRAM_PROXY") or None
+    session = AiohttpSession(proxy=proxy) if proxy else AiohttpSession()
+    if proxy:
+        log.info("Telegram: работаю через прокси")
+    bot = Bot(token=token, session=session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    await bot.set_my_commands([
+    commands = [
         BotCommand(command="start", description="Приветствие и меню"),
         BotCommand(command="add_expense", description="Записать расход"),
         BotCommand(command="stats", description="Диаграмма расходов за месяц"),
@@ -634,12 +641,38 @@ async def main() -> None:
         BotCommand(command="add_debt", description="Добавить долг"),
         BotCommand(command="debts", description="Долги и план «Лавина»"),
         BotCommand(command="cancel", description="Отменить диалог"),
-    ])
+    ]
+
+    async def publish_commands() -> None:
+        """Меню команд. Если Telegram пока недоступен, повторяем, а бот не падает."""
+        while True:
+            try:
+                await bot.set_my_commands(commands)
+                log.info("Меню команд обновлено")
+                return
+            except TelegramUnauthorizedError:
+                raise
+            except Exception as e:  # сеть, VPN, прокси: ждём и пробуем снова
+                log.warning("Telegram пока недоступен (%s), повторю через 30 секунд. Проверьте VPN или TELEGRAM_PROXY",
+                            type(e).__name__)
+                await asyncio.sleep(30)
+
+    commands_task = asyncio.create_task(publish_commands())
 
     log.info("Бот запущен")
     try:
-        await dp.start_polling(bot)
+        while True:
+            try:
+                await dp.start_polling(bot)
+                break
+            except TelegramUnauthorizedError:
+                raise RuntimeError("Telegram не принял BOT_TOKEN. Проверьте токен в .env.") from None
+            except Exception as e:
+                log.warning("Нет связи с Telegram (%s), повторю через 30 секунд. Проверьте VPN или TELEGRAM_PROXY",
+                            type(e).__name__)
+                await asyncio.sleep(30)
     finally:
+        commands_task.cancel()
         await bot.session.close()
 
 
