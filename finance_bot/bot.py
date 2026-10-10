@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import re
+import sqlite3
 from datetime import date, datetime
 from html import escape
 
@@ -26,6 +27,7 @@ import database as db  # noqa: E402
 import sheets_engine  # noqa: E402
 from chart_engine import build_month_chart  # noqa: E402
 from debt_engine import avalanche_savings  # noqa: E402
+from statements.report import build_report, default_start, format_telegram  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -73,7 +75,8 @@ HELP_TEXT = (
     "<b>Расходы</b>\n"
     "/add_expense <code>сумма категория [описание]</code> — записать расход\n"
     "   например: <code>/add_expense 450 Еда обед в кафе</code>\n"
-    "/stats — диаграмма расходов за текущий месяц\n\n"
+    "/stats — диаграмма расходов за текущий месяц\n"
+    "/report <code>[ГГГГ-ММ-ДД]</code> — отчёт по загруженным банковским выпискам\n\n"
     "<b>Долги</b>\n"
     "/add_debt — добавить долг (пошаговый диалог)\n"
     "/debts — список долгов и порядок погашения по «Лавине»\n"
@@ -347,6 +350,36 @@ async def cmd_stats(message: Message) -> None:
     )
 
 
+# ---------- /report (банковские выписки) ----------
+
+def _report_text(start: str) -> str | None:
+    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        report = build_report(conn, start)
+    finally:
+        conn.close()
+    return format_telegram(report) if report else None
+
+
+@router.message(Command("report"))
+async def cmd_report(message: Message, command: CommandObject) -> None:
+    start = default_start()
+    if command.args:
+        try:
+            start = date.fromisoformat(command.args.strip()).isoformat()
+        except ValueError:
+            await message.answer("Формат: <code>/report [ГГГГ-ММ-ДД]</code>, например <code>/report 2026-04-01</code>")
+            return
+    text = await asyncio.to_thread(_report_text, start)
+    if text is None:
+        await message.answer(
+            "Операций из выписок за этот период нет.\n"
+            "Загрузите выписки на компьютере: <code>python import_statements.py папка_с_pdf</code>"
+        )
+        return
+    await message.answer(text)
+
+
 # ---------- Запуск ----------
 
 async def main() -> None:
@@ -368,6 +401,7 @@ async def main() -> None:
         BotCommand(command="start", description="Приветствие и меню"),
         BotCommand(command="add_expense", description="Записать расход"),
         BotCommand(command="stats", description="Диаграмма расходов за месяц"),
+        BotCommand(command="report", description="Отчёт по банковским выпискам"),
         BotCommand(command="add_debt", description="Добавить долг"),
         BotCommand(command="debts", description="Долги и план «Лавина»"),
         BotCommand(command="cancel", description="Отменить диалог"),
