@@ -55,6 +55,15 @@ def _get_worksheet() -> gspread.Worksheet:
     return _worksheet
 
 
+def get_spreadsheet() -> gspread.Spreadsheet:
+    """Вся таблица целиком (для выгрузки выписок на отдельные вкладки)."""
+    name = os.getenv("GOOGLE_SPREADSHEET_NAME")
+    if not name:
+        raise RuntimeError("Не задана переменная окружения GOOGLE_SPREADSHEET_NAME")
+    with _lock:
+        return gspread.service_account(filename=str(_credentials_path())).open(name)
+
+
 def append_transaction(
     date: date_type | datetime | str,
     user_id: int,

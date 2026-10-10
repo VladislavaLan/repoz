@@ -112,6 +112,20 @@ def backup(db_path: str) -> str | None:
     return dst
 
 
+def _export_to_sheets(conn: sqlite3.Connection) -> None:
+    """После импорта обновляет вкладки «Выписки» и «Итоги по месяцам» в Google Таблице (если она подключена)."""
+    try:
+        import sheets_engine
+        from .sheets_export import export
+        if not sheets_engine.is_enabled():
+            print("Google Таблица не подключена: выгрузка пропущена.")
+            return
+        r = export(conn, sheets_engine.get_spreadsheet())
+        print(f"Google Таблица обновлена: вкладка «Выписки» {r['detail_rows']} строк, «Итоги по месяцам».")
+    except Exception as e:  # сеть/доступ не должны ломать импорт
+        print(f"Не удалось обновить Google Таблицу ({type(e).__name__}: {e}). Повторить можно командой /sheet в боте.")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Импорт PDF-выписок Сбера и Альфа-Банка в базу бота")
     ap.add_argument("folder", help="папка с PDF-выписками (или один PDF)")
@@ -161,6 +175,7 @@ def main(argv: list[str] | None = None) -> int:
         n = drop_screenshot_dupes(conn)
         if n:
             print(f"Помечено {n} ручных/скриншотных операций как дубли: они теперь есть в выписках.")
+        _export_to_sheets(conn)
     finally:
         conn.close()
     return 1 if failed else 0

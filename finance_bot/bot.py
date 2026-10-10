@@ -19,6 +19,8 @@ load_dotenv()  # до импорта database, чтобы подхватить D
 
 from aiogram import Bot, Dispatcher, F, Router  # noqa: E402
 from aiogram.client.default import DefaultBotProperties  # noqa: E402
+from aiogram.client.session.aiohttp import AiohttpSession  # noqa: E402
+from aiogram.exceptions import TelegramUnauthorizedError  # noqa: E402
 from aiogram.enums import ParseMode  # noqa: E402
 from aiogram.filters import Command, CommandObject, CommandStart  # noqa: E402
 from aiogram.fsm.context import FSMContext  # noqa: E402
@@ -30,7 +32,7 @@ import database as db  # noqa: E402
 import sheets_engine  # noqa: E402
 from chart_engine import build_month_chart  # noqa: E402
 from debt_engine import avalanche_savings  # noqa: E402
-from statements import insights, manual, screenshot  # noqa: E402
+from statements import insights, manual, screenshot, sheets_export  # noqa: E402
 from statements import normalize as nz  # noqa: E402
 from statements.importer import write as write_txns  # noqa: E402
 from statements.report import build_report, default_start, format_telegram  # noqa: E402
@@ -79,11 +81,12 @@ def months_text(n: int) -> str:
 HELP_TEXT = (
     "👋 <b>Бот учёта финансов и долгов</b>\n\n"
     "<b>Расходы</b>\n"
-    "/add_expense <code>сумма категория [описание]</code> — записать расход\n"
-    "   например: <code>/add_expense 450 Еда обед в кафе</code>\n"
+    "/add_expense — записать расход (бот спросит сумму, категорию и описание)\n"
+    "   или сразу: <code>/add_expense 450 Еда обед в кафе</code>\n"
     "/stats — диаграмма расходов за текущий месяц\n"
     "/report <code>[ГГГГ-ММ-ДД]</code> — отчёт по загруженным банковским выпискам\n"
     "📷 Пришлите скриншот истории операций из банка — я распознаю его и предложу сохранить\n"
+    "/sheet — выгрузить операции из выписок в Google Таблицу (вкладки «Выписки» и «Итоги по месяцам»)\n"
     "/advice <code>[ГГГГ-ММ-ДД]</code> — комментарии и советы по тратам (с ключом Gemini — и от нейросети)\n\n"
     "<b>Долги</b>\n"
     "/add_debt — добавить долг (пошаговый диалог)\n"
@@ -124,36 +127,141 @@ def _sync_manual() -> int:
         conn.close()
 
 
+async def _save_expense(user_id: int, amount: float, category: str, description: str) -> str:
+    """Записывает расход (база + общая таблица + Google Таблица). Возвращает текст подтверждения."""
+    await db.add_expense(amount, category, description)
+    await asyncio.to_thread(_sync_manual)      # копия в общую таблицу для /report и /advice
+    # Дублируем в Google Таблицу в фоне: ответ пользователю не ждёт сети.
+    sheets_engine.schedule_append(date.today(), user_id, category, amount, description, "expense")
+    text = f"✅ Записал расход: <b>{money(amount)}</b> — {escape(category)}"
+    if description:
+        text += f" ({escape(description)})"
+    return text
+
+
+class AddExpense(StatesGroup):
+    amount = State()
+    category = State()
+    description = State()
+
+
+DEFAULT_CATEGORIES = ["Продукты", "Кафе и рестораны", "Транспорт", "Покупки", "Здоровье", "Развлечения",
+                      "Связь и подписки", "Дом и ЖКХ"]
+
+
+def _category_choices() -> list[str]:
+    """Сначала твои частые категории из ручных трат, потом стандартные."""
+    out: list[str] = []
+    try:
+        conn = sqlite3.connect(db.DB_PATH)
+        try:
+            for (c,) in conn.execute("SELECT category FROM expenses GROUP BY category ORDER BY COUNT(*) DESC LIMIT 6"):
+                if c not in out:
+                    out.append(c)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        pass
+    for c in DEFAULT_CATEGORIES:
+        if c not in out and len(out) < 10:
+            out.append(c)
+    return out
+
+
 @router.message(Command("add_expense"))
-async def cmd_add_expense(message: Message, command: CommandObject) -> None:
-    usage = "Формат: <code>/add_expense сумма категория [описание]</code>\nНапример: <code>/add_expense 450 Еда обед</code>"
-    if not command.args:
-        await message.answer(usage)
+async def cmd_add_expense(message: Message, command: CommandObject, state: FSMContext) -> None:
+    if not command.args:                       # из меню: задаём вопросы по шагам
+        await state.clear()
+        await state.set_state(AddExpense.amount)
+        await message.answer("💸 Сколько потратили? Напишите сумму, например <code>450</code>.\n"
+                             "Можно сразу всё: <code>450 Еда обед</code>. /cancel — отмена.")
         return
 
     match = EXPENSE_RE.match(command.args)
     if not match:
-        await message.answer(f"Не понял запись.\n{usage}")
+        await message.answer("Не понял запись. Пример: <code>/add_expense 450 Еда обед</code>\n"
+                             "Или просто отправьте /add_expense и ответьте на вопросы.")
         return
-
     amount = parse_number(match["amount"])
     if amount <= 0:
         await message.answer("Сумма должна быть больше нуля.")
         return
+    await state.clear()
+    await message.answer(await _save_expense(message.from_user.id, amount, match["category"].capitalize(),
+                                             (match["description"] or "").strip()))
 
-    category = match["category"].capitalize()
-    description = (match["description"] or "").strip()
-    await db.add_expense(amount, category, description)
-    await asyncio.to_thread(_sync_manual)      # копия в общую таблицу для /report и /advice
-    # Дублируем в Google Таблицу в фоне: ответ пользователю не ждёт сети.
-    sheets_engine.schedule_append(
-        date.today(), message.from_user.id, category, amount, description, "expense"
-    )
 
-    text = f"✅ Записал расход: <b>{money(amount)}</b> — {escape(category)}"
-    if description:
-        text += f" ({escape(description)})"
-    await message.answer(text)
+@router.message(AddExpense.amount, F.text, ~F.text.startswith("/"))
+async def expense_amount(message: Message, state: FSMContext) -> None:
+    text = message.text.strip()
+    full = EXPENSE_RE.match(text)
+    if full and re.search(r"[A-Za-zА-Яа-яЁё]", full["category"]):     # «450 Еда обед» одним сообщением
+        amount = parse_number(full["amount"])
+        if amount > 0:
+            await state.clear()
+            await message.answer(await _save_expense(message.from_user.id, amount, full["category"].capitalize(),
+                                                     (full["description"] or "").strip()))
+            return
+    try:
+        amount = parse_number(text)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Введите сумму числом, например <code>450</code> или <code>1 200,50</code>.")
+        return
+    cats = _category_choices()
+    await state.update_data(amount=amount, cats=cats)
+    await state.set_state(AddExpense.category)
+    rows = [[InlineKeyboardButton(text=c, callback_data=f"exp:c{i}") for i, c in enumerate(cats)][j:j + 2]
+            for j in range(0, len(cats), 2)]
+    await message.answer(f"Сумма: <b>{money(amount)}</b>. Выберите категорию кнопкой или напишите свою:",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+async def _ask_description(target: Message, state: FSMContext, category: str) -> None:
+    await state.update_data(category=category)
+    await state.set_state(AddExpense.description)
+    await target.answer(
+        f"Категория: <b>{escape(category)}</b>. Добавьте описание (например, «обед») или нажмите кнопку:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Без описания", callback_data="exp:skip")]]))
+
+
+@router.message(AddExpense.category, F.text, ~F.text.startswith("/"))
+async def expense_category_text(message: Message, state: FSMContext) -> None:
+    category = message.text.strip()[:40].capitalize()
+    await _ask_description(message, state, category)
+
+
+@router.message(AddExpense.description, F.text, ~F.text.startswith("/"))
+async def expense_description(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    await state.clear()
+    await message.answer(await _save_expense(message.from_user.id, data["amount"], data["category"],
+                                             message.text.strip()[:200]))
+
+
+@router.callback_query(F.data.startswith("exp:"))
+async def on_expense_button(cb: CallbackQuery, state: FSMContext) -> None:
+    if _allowed and cb.from_user.id not in _allowed:
+        await cb.answer()
+        return
+    data = await state.get_data()
+    action = cb.data.split(":", 1)[1]
+    if action.startswith("c") and await state.get_state() == AddExpense.category.state:
+        cats = data.get("cats", [])
+        idx = int(action[1:])
+        if idx < len(cats):
+            await cb.message.edit_reply_markup(reply_markup=None)
+            await _ask_description(cb.message, state, cats[idx])
+    elif action == "skip" and await state.get_state() == AddExpense.description.state:
+        await state.clear()
+        await cb.message.edit_reply_markup(reply_markup=None)
+        await cb.message.answer(await _save_expense(cb.from_user.id, data["amount"], data["category"], ""))
+    else:
+        await cb.answer("Этот вопрос уже закрыт. Начните заново: /add_expense", show_alert=True)
+        return
+    await cb.answer()
 
 
 # ---------- /add_debt (FSM) ----------
@@ -400,6 +508,33 @@ async def cmd_report(message: Message, command: CommandObject) -> None:
     await message.answer(text)
 
 
+# ---------- /sheet (выгрузка в Google Таблицу) ----------
+
+def _export_sheet() -> dict:
+    spreadsheet = sheets_engine.get_spreadsheet()
+    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        return sheets_export.export(conn, spreadsheet)
+    finally:
+        conn.close()
+
+
+@router.message(Command("sheet"))
+async def cmd_sheet(message: Message) -> None:
+    if not sheets_engine.is_enabled():
+        await message.answer("Google Таблица не подключена (нет credentials.json или GOOGLE_SPREADSHEET_NAME в .env).")
+        return
+    wait = await message.answer("Выгружаю операции в Google Таблицу…")
+    try:
+        r = await asyncio.to_thread(_export_sheet)
+    except Exception as e:
+        log.exception("Выгрузка в Google Таблицу не удалась")
+        await wait.edit_text(f"Не получилось: {escape(type(e).__name__)}. Подробности в окне бота.")
+        return
+    await wait.edit_text(f"✅ Готово. Вкладка «{sheets_export.DETAIL_TAB}»: {r['detail_rows']} операций, "
+                         f"вкладка «{sheets_export.SUMMARY_TAB}» обновлена.")
+
+
 # ---------- /advice (комментарии и рекомендации) ----------
 
 def _advice_parts(start: str) -> tuple[list[str], dict] | None:
@@ -621,25 +756,57 @@ async def main() -> None:
     else:
         log.info("Google Sheets выключен (нет GOOGLE_SPREADSHEET_NAME или credentials.json)")
 
-    bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    # Если Telegram не открывается напрямую, укажите прокси в .env: TELEGRAM_PROXY=socks5://127.0.0.1:1080
+    proxy = os.getenv("TELEGRAM_PROXY") or None
+    session = AiohttpSession(proxy=proxy) if proxy else AiohttpSession()
+    if proxy:
+        log.info("Telegram: работаю через прокси")
+    bot = Bot(token=token, session=session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    await bot.set_my_commands([
+    commands = [
         BotCommand(command="start", description="Приветствие и меню"),
         BotCommand(command="add_expense", description="Записать расход"),
         BotCommand(command="stats", description="Диаграмма расходов за месяц"),
         BotCommand(command="report", description="Отчёт по банковским выпискам"),
+        BotCommand(command="sheet", description="Выгрузить операции в Google Таблицу"),
         BotCommand(command="advice", description="Комментарии и советы по тратам"),
         BotCommand(command="add_debt", description="Добавить долг"),
         BotCommand(command="debts", description="Долги и план «Лавина»"),
         BotCommand(command="cancel", description="Отменить диалог"),
-    ])
+    ]
+
+    async def publish_commands() -> None:
+        """Меню команд. Если Telegram пока недоступен, повторяем, а бот не падает."""
+        while True:
+            try:
+                await bot.set_my_commands(commands)
+                log.info("Меню команд обновлено")
+                return
+            except TelegramUnauthorizedError:
+                raise
+            except Exception as e:  # сеть, VPN, прокси: ждём и пробуем снова
+                log.warning("Telegram пока недоступен (%s), повторю через 30 секунд. Проверьте VPN или TELEGRAM_PROXY",
+                            type(e).__name__)
+                await asyncio.sleep(30)
+
+    commands_task = asyncio.create_task(publish_commands())
 
     log.info("Бот запущен")
     try:
-        await dp.start_polling(bot)
+        while True:
+            try:
+                await dp.start_polling(bot)
+                break
+            except TelegramUnauthorizedError:
+                raise RuntimeError("Telegram не принял BOT_TOKEN. Проверьте токен в .env.") from None
+            except Exception as e:
+                log.warning("Нет связи с Telegram (%s), повторю через 30 секунд. Проверьте VPN или TELEGRAM_PROXY",
+                            type(e).__name__)
+                await asyncio.sleep(30)
     finally:
+        commands_task.cancel()
         await bot.session.close()
 
 

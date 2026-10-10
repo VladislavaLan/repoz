@@ -12,7 +12,7 @@ from decimal import Decimal
 
 from statements import alfa, config, sber
 from statements import normalize as nz
-from statements import insights, manual, screenshot
+from statements import insights, manual, screenshot, sheets_export
 from statements.importer import dedupe, write
 from statements.report import build_report, format_telegram
 
@@ -294,6 +294,43 @@ class ManualExpenses(unittest.TestCase):
         cats = nz.all_categories()
         for c in ("Продукты", "Транспорт", "Прочее"):
             self.assertIn(c, cats)
+
+
+class FakeWS:
+    def __init__(self): self.data = None; self.cleared = 0
+    def clear(self): self.cleared += 1
+    def update(self, values, range_name, value_input_option): self.data = values
+    def freeze(self, rows): pass
+    def format(self, rng, fmt): pass
+
+
+class FakeSheet:
+    url = "https://example.test/sheet"
+    def __init__(self): self.tabs = {}
+    def worksheet(self, title):
+        if title not in self.tabs:
+            raise KeyError(title)
+        return self.tabs[title]
+    def add_worksheet(self, title, rows, cols):
+        self.tabs[title] = FakeWS()
+        return self.tabs[title]
+
+
+class SheetsExport(unittest.TestCase):
+    def test_export_is_idempotent_and_summarises(self):
+        conn = sqlite3.connect(":memory:")
+        mk = lambda fp, d, kop, t, cat, src="alfa_0000": nz.Txn(src, fp, date.fromisoformat(d), None, kop, t, cat, "SHOP", "")
+        write(conn, [mk("a", "2026-04-02", 10_000_000, "income", "Зарплата"), mk("b", "2026-04-05", -150_000, "expense", "Продукты"),
+                     mk("c", "2026-04-06", 50_000, "refund", "Продукты"), mk("d", "2026-04-07", -500, "technical", ""),
+                     mk("e", "2026-05-01", -200_000, "expense", "Продукты", "manual")])
+        sheet = FakeSheet()
+        r1 = sheets_export.export(conn, sheet, "2026-04-01")
+        r2 = sheets_export.export(conn, sheet, "2026-04-01")
+        self.assertEqual((r1["detail_rows"], r2["detail_rows"]), (4, 4))        # технические проводки не выгружаются
+        self.assertEqual(sheet.tabs["Выписки"].cleared, 2)                      # вкладка перезаписывается, а не дополняется
+        summary = {row[0]: row for row in sheet.tabs["Итоги по месяцам"].data}
+        self.assertEqual(summary["Траты"][1:], [1000.0, 2000.0, 3000.0])        # апрель: 1500-500, май: 2000
+        self.assertEqual(sheet.tabs["Выписки"].data[1][5], "Вручную")
 
 
 if __name__ == "__main__":
