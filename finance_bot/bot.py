@@ -23,6 +23,7 @@ from aiogram.fsm.storage.memory import MemoryStorage  # noqa: E402
 from aiogram.types import BotCommand, BufferedInputFile, Message  # noqa: E402
 
 import database as db  # noqa: E402
+import sheets_engine  # noqa: E402
 from chart_engine import build_month_chart  # noqa: E402
 from debt_engine import avalanche_savings  # noqa: E402
 
@@ -121,6 +122,10 @@ async def cmd_add_expense(message: Message, command: CommandObject) -> None:
     category = match["category"].capitalize()
     description = (match["description"] or "").strip()
     await db.add_expense(amount, category, description)
+    # Дублируем в Google Таблицу в фоне: ответ пользователю не ждёт сети.
+    sheets_engine.schedule_append(
+        date.today(), message.from_user.id, category, amount, description, "expense"
+    )
 
     text = f"✅ Записал расход: <b>{money(amount)}</b> — {escape(category)}"
     if description:
@@ -350,6 +355,10 @@ async def main() -> None:
         raise RuntimeError("Не задан BOT_TOKEN. Скопируйте .env.example в .env и укажите токен.")
 
     await db.init_db()
+    if sheets_engine.is_enabled():
+        log.info("Google Sheets: запись в таблицу «%s» включена", os.getenv("GOOGLE_SPREADSHEET_NAME"))
+    else:
+        log.info("Google Sheets выключен (нет GOOGLE_SPREADSHEET_NAME или credentials.json)")
 
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
