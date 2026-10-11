@@ -27,9 +27,8 @@ def _icon(cur: float, usual: float | None) -> str:
     return "🟡" if cur <= usual * 1.4 else "🔴"
 
 
-def build(conn: sqlite3.Connection, today: date | None = None, big_limit: int | None = None) -> str | None:
-    today = today or date.today()
-    big_limit = big_limit or int(config.load().get("big_purchase", 20000))
+def compute(conn: sqlite3.Connection, today: date, big_limit: int):
+    """Недельные суммы по категориям. Возвращает dict или None, если расходов нет."""
     first = conn.execute("SELECT MIN(date) FROM transactions WHERE type IN ('expense','refund')").fetchone()[0]
     if not first:
         return None
@@ -39,12 +38,13 @@ def build(conn: sqlite3.Connection, today: date | None = None, big_limit: int | 
     rows = conn.execute(
         "SELECT date, type, amount_kop, category, fingerprint FROM transactions "
         "WHERE type IN ('expense','refund') AND date >= ? AND date <= ?",
-        (since.isoformat(), today.isoformat())).fetchall()
+        (min(since, today.replace(day=1)).isoformat(), today.isoformat())).fetchall()
 
     week = defaultdict(lambda: defaultdict(float))   # номер окна -> категория -> сумма
     big_now: list[tuple[str, float]] = []
     month_start = today.replace(day=1).isoformat()
     month = defaultdict(float)
+    day_spend = defaultdict(float)
     for d, t, a, cat, fp in rows:
         cat = cat or "Прочее"
         if cat == IGNORE:
@@ -55,14 +55,26 @@ def build(conn: sqlite3.Connection, today: date | None = None, big_limit: int | 
                 big_now.append((cat, amount))
             continue
         k = (today - date.fromisoformat(d)).days // 7
-        week[k][cat] += amount
+        if k <= WEEKS_BACK:
+            week[k][cat] += amount
         if d >= month_start:
             month[cat] += amount
+        if d == today.isoformat():
+            day_spend[cat] += amount
 
-    # окна, целиком попадающие в период, за который есть данные
     past = [k for k in range(1, WEEKS_BACK + 1) if today - timedelta(days=7 * k + 6) >= first_day]
     cats = set(week[0]) | {c for k in past for c in week[k]}
     usual = {c: median([week[k].get(c, 0.0) for k in past]) for c in cats} if len(past) >= MIN_WEEKS else {}
+    return {"week": week, "month": month, "past": past, "cats": cats, "usual": usual, "big_now": big_now, "day": day_spend}
+
+
+def build(conn: sqlite3.Connection, today: date | None = None, big_limit: int | None = None) -> str | None:
+    today = today or date.today()
+    big_limit = big_limit or int(config.load().get("big_purchase", 20000))
+    data = compute(conn, today, big_limit)
+    if data is None:
+        return None
+    week, month, past, cats, usual, big_now = (data[k] for k in ("week", "month", "past", "cats", "usual", "big_now"))
     total_now = sum(week[0].values())
     totals_past = [sum(week[k].values()) for k in past]
     total_usual = median(totals_past) if len(past) >= MIN_WEEKS else None

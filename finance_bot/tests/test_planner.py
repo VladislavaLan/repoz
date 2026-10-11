@@ -147,3 +147,35 @@ class WeekTests(unittest.TestCase):
         c2.execute("CREATE TABLE transactions (date TEXT, amount_kop INTEGER, type TEXT, category TEXT, merchant TEXT, fingerprint TEXT)")
         c2.execute("INSERT INTO transactions VALUES ('2026-10-10',-100000,'expense','Продукты','x','z')")
         self.assertIn("Норма пока не считается", week.build(c2, today=today))
+
+
+class BudgetTests(unittest.TestCase):
+    def _db(self):
+        import sqlite3
+        from datetime import date, timedelta
+        c = sqlite3.connect(":memory:")
+        c.execute("CREATE TABLE transactions (date TEXT, amount_kop INTEGER, type TEXT, category TEXT, merchant TEXT, fingerprint TEXT)")
+        today = date(2026, 10, 12)
+        rows = [((today - timedelta(days=7 * k)).isoformat(), -300000, "expense", "Продукты", "x", f"a{k}") for k in range(1, 7)]
+        rows.append(("2026-10-12", -500000, "expense", "Продукты", "x", "n1"))
+        rows.append(("2026-10-03", -1200000, "expense", "Продукты", "x", "n2"))
+        c.executemany("INSERT INTO transactions VALUES (?,?,?,?,?,?)", rows)
+        return c, today
+
+    def test_status_and_today(self):
+        from statements import budget
+        c, today = self._db()
+        budget.set_limit(c, "Продукты", 20000)
+        t = budget.status(c, today)
+        self.assertIn("Продукты", t)
+        self.assertIn("осталось", t)    # 17 000 из 20 000 -> 85%
+        self.assertIn("🟡", t)
+        self.assertIn("Всего по лимитам", budget.today_text(c, today))
+        self.assertTrue(budget.warnings(c, today))
+
+    def test_auto(self):
+        from statements import budget
+        c, today = self._db()
+        res = budget.auto(c, today)
+        self.assertEqual(res["Продукты"], 13000.0)   # 3000 в неделю * 30,4 / 7 ≈ 13 029 -> 13 000
+        self.assertEqual(budget.list_limits(c)["Продукты"], 13000.0)

@@ -37,6 +37,7 @@ from statements import edit_sheet, insights, manual, planner, recat, screenshot,
 from statements import summary as st_summary  # noqa: E402
 from statements import category_dive as st_category  # noqa: E402
 from statements import week as st_week  # noqa: E402
+from statements import budget as st_budget  # noqa: E402
 from statements import normalize as nz  # noqa: E402
 from statements.importer import write as write_txns  # noqa: E402
 from statements.report import build_report, default_start, format_telegram  # noqa: E402
@@ -177,6 +178,8 @@ HELP_TEXT = (
     "/balance <code>сумма</code> — сколько денег сейчас · /reserve <code>сумма</code> — резерв · /living <code>сумма</code> — обычные траты в месяц\n"
     "/plan_add <code>23.10.2026 +90000 Аванс</code> — приход или трата в плане · /plan_list · /plan_del <code>id</code>\n"
     "/plan <code>[до даты]</code> — прогноз по дням с кредитками и дедлайнами\n"
+    "/budget — лимиты по категориям на месяц: <code>/budget авто</code>, <code>/budget Продукты 25000</code>\n"
+    "/today — сколько можно потратить сегодня в рамках лимитов\n"
     "/week — траты за 7 дней по категориям: где выше обычного, где в норме\n"
     "/cat <code>категория [период]</code> — разбор категории: покупки, средний чек, магазины, рост из-за цен или привычек\n"
     "/summary — компактная сводка по месяцам и категориям (можно показать ассистенту)\n"
@@ -223,6 +226,13 @@ async def _save_expense(user_id: int, amount: float, category: str, description:
     text = f"✅ Записал расход: <b>{money(amount)}</b> — {escape(category)}"
     if description:
         text += f" ({escape(description)})"
+    try:
+        warns = await asyncio.to_thread(_db_call, st_budget.warnings)
+    except Exception:  # предупреждения не должны ломать запись траты
+        log.exception("Не удалось проверить лимиты")
+        warns = []
+    if warns:
+        text += "\n\n" + "\n".join(escape(w) for w in warns)
     return text
 
 
@@ -859,6 +869,53 @@ async def cmd_cat(message: Message, command: CommandObject) -> None:
 async def cmd_week(message: Message) -> None:
     text = await asyncio.to_thread(_db_call, st_week.build)
     await message.answer(text or "Операций пока нет.")
+
+
+@router.message(Command("budget"))
+async def cmd_budget(message: Message, command: CommandObject) -> None:
+    """/budget — статус; /budget Категория сумма — лимит на месяц; /budget Категория - — убрать; /budget авто."""
+    args = (command.args or "").strip()
+    if not args:
+        await asyncio.to_thread(_sync_manual)
+        await message.answer(await asyncio.to_thread(_db_call, st_budget.status))
+        return
+    if args.lower() in ("авто", "auto"):
+        await asyncio.to_thread(_sync_manual)
+        res = await asyncio.to_thread(_db_call, st_budget.auto)
+        if not res:
+            await message.answer("Для автолимитов нужна история минимум за 3 полные недели. Пока задайте вручную: "
+                                 "<code>/budget Продукты 25000</code>.")
+            return
+        lines = [f"{escape(c)}: {_ru(int(v * 100))} в месяц" for c, v in sorted(res.items(), key=lambda kv: -kv[1])]
+        await message.answer("<b>Лимиты поставлены по вашим обычным тратам</b>\n" + "\n".join(lines)
+                             + "\n\nПодправьте нужные: <code>/budget Продукты 25000</code>. Статус: /budget")
+        return
+    cats = sorted(nz.all_categories(), key=len, reverse=True)
+    cat = next((c for c in cats if args.lower().startswith(c.lower())), None)
+    rest = args[len(cat):].strip() if cat else ""
+    if not cat or not rest:
+        await message.answer("Формат: <code>/budget Продукты 25000</code>, убрать: <code>/budget Продукты -</code>, "
+                             "посмотреть: /budget. Категории: " + ", ".join(cats))
+        return
+    if rest in ("-", "нет", "0"):
+        ok = await asyncio.to_thread(_db_call, st_budget.delete_limit, cat)
+        await message.answer(f"Лимит на «{escape(cat)}» убран." if ok else f"Лимита на «{escape(cat)}» и не было.")
+        return
+    try:
+        limit = float(rest.replace(" ", "").replace("₽", "").replace(",", "."))
+        if limit <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Сумма должна быть числом, например <code>/budget Продукты 25000</code>.")
+        return
+    await asyncio.to_thread(_db_call, st_budget.set_limit, cat, limit)
+    await message.answer(f"✅ Лимит на «{escape(cat)}»: {_ru(int(limit * 100))} в месяц. Статус: /budget")
+
+
+@router.message(Command("today"))
+async def cmd_today(message: Message) -> None:
+    await asyncio.to_thread(_sync_manual)
+    await message.answer(await asyncio.to_thread(_db_call, st_budget.today_text))
 
 
 # ---------- /report (банковские выписки) ----------
@@ -1664,6 +1721,8 @@ async def main() -> None:
         BotCommand(command="balance", description="Сколько денег сейчас"),
         BotCommand(command="living", description="Обычные траты в месяц для плана"),
         BotCommand(command="summary", description="Сводка по месяцам"),
+        BotCommand(command="budget", description="Лимиты по категориям"),
+        BotCommand(command="today", description="Сколько можно потратить сегодня"),
         BotCommand(command="week", description="Траты за неделю против обычного"),
         BotCommand(command="cat", description="Разбор категории"),
         BotCommand(command="cancel", description="Отменить диалог"),
