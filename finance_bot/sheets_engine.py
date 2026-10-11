@@ -60,8 +60,24 @@ def get_spreadsheet() -> gspread.Spreadsheet:
     name = os.getenv("GOOGLE_SPREADSHEET_NAME")
     if not name:
         raise RuntimeError("Не задана переменная окружения GOOGLE_SPREADSHEET_NAME")
-    with _lock:
-        return gspread.service_account(filename=str(_credentials_path())).open(name)
+    import time
+    last: Exception | None = None
+    for attempt in range(3):                       # обрывы связи (VPN) часто разовые: пробуем ещё раз
+        try:
+            with _lock:
+                client = gspread.service_account(filename=str(_credentials_path()))
+                try:
+                    client.set_timeout(30)         # не ждать минутами, если связи нет
+                except Exception:
+                    pass
+                return client.open(name)
+        except gspread.exceptions.GSpreadException:
+            raise                                  # не найдена таблица, нет доступа и т.п. — повтор не поможет
+        except Exception as e:
+            last = e
+            log.warning("Google Таблицы недоступны (%s), попытка %s из 3", type(e).__name__, attempt + 1)
+            time.sleep(2)
+    raise last  # type: ignore[misc]
 
 
 def append_transaction(

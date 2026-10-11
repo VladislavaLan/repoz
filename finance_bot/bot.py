@@ -605,7 +605,7 @@ async def cmd_sheet(message: Message) -> None:
         r = await asyncio.to_thread(_export_sheet)
     except Exception as e:
         log.exception("Выгрузка в Google Таблицу не удалась")
-        await wait.edit_text(f"Не получилось: {escape(type(e).__name__)}. Подробности в окне бота.")
+        await wait.edit_text(_sheet_error_text(e))
         return
     await wait.edit_text(f"✅ Готово. Вкладка «{sheets_export.DETAIL_TAB}»: {r['detail_rows']} операций, "
                          f"вкладка «{sheets_export.SUMMARY_TAB}» обновлена.")
@@ -698,6 +698,15 @@ async def _open_recat(target: Message, user_id: int, query: str, edit: bool = Fa
         await target.edit_text(_rc_text(p), reply_markup=_rc_kb(token, p))
     else:
         await target.answer(_rc_text(p), reply_markup=_rc_kb(token, p))
+
+
+def _sheet_error_text(e: Exception) -> str:
+    """Понятное сообщение об ошибке Google Таблицы."""
+    name = type(e).__name__
+    if name in ("SSLError", "ConnectionError", "ReadTimeout", "ConnectTimeout", "Timeout", "ProxyError", "TransportError"):
+        return ("Не получилось связаться с Google Таблицами (обрыв связи). Это бывает из-за VPN: смените сервер или режим "
+                "и повторите команду. Ничего не изменилось.")
+    return f"Не получилось: {escape(name)}. Подробности в окне бота."
 
 
 def _d_iso(iso: str) -> str:
@@ -1019,7 +1028,7 @@ async def _run_edit_sheet(message: Message, start: str | None, end: str | None) 
         r = await asyncio.to_thread(_edit_sheet_export, start, end)
     except Exception as e:
         log.exception("Не удалось выгрузить вкладку правок")
-        await wait.edit_text(f"Не получилось: {escape(type(e).__name__)}. Подробности в окне бота.")
+        await wait.edit_text(_sheet_error_text(e))
         return
     await wait.edit_text(
         f"✅ Вкладка «{edit_sheet.TAB}» готова: {r['rows']} операций, "
@@ -1084,7 +1093,7 @@ async def cmd_apply_sheet(message: Message) -> None:
     except Exception as e:
         log.exception("Не удалось применить правки из таблицы")
         text = ("На таблице нет вкладки «%s». Сначала /edit_sheet." % edit_sheet.TAB
-                if type(e).__name__ == "WorksheetNotFound" else f"Не получилось: {escape(type(e).__name__)}. Подробности в окне бота.")
+                if type(e).__name__ == "WorksheetNotFound" else _sheet_error_text(e))
         await wait.edit_text(text)
         return
     lines = [f"✅ Применено. Категорий изменено: {st['category']}, плановых отметок: {st['planned']}, разбивок: {st['split']}."]
