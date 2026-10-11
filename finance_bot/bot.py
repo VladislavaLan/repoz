@@ -663,7 +663,7 @@ _PLAN_HELP = (
     "1. Остаток на счетах сейчас: <code>/balance 21888</code>\n"
     "2. Приходы и траты: <code>/plan_add 23.10.2026 +90000 Аванс</code>, "
     "<code>/plan_add 06.11.2026 -100000 ЭКО</code>\n"
-    "   добавь слово «ежемесячно» для повторов, «приоритет 2» (1 неизбежно, 2 можно сдвинуть, 3 по желанию)\n"
+    "   добавь «ежемесячно» для повторов, «рабочий» (если выходной или праздник — раньше, в рабочий день), «приоритет 2» (1 неизбежно, 2 можно сдвинуть, 3 по желанию)\n"
     "3. Резерв, который не отдавать на кредитку: <code>/reserve 30000</code>\n"
     "4. Прогноз: <code>/plan</code> или <code>/plan 31.01.2027</code> (по какую дату считать)\n"
     "Убрать пункт: <code>/plan_del id</code>"
@@ -710,12 +710,15 @@ async def cmd_plan_add(message: Message, command: CommandObject) -> None:
         return
     rest = words[2:]
     monthly = False
+    workday = False
     priority = 1
     title: list[str] = []
     i = 0
     while i < len(rest):
         w = rest[i].lower()
-        if w in ("ежемесячно", "каждый"):
+        if w in ("рабочий", "будни", "будний"):
+            workday = True
+        elif w in ("ежемесячно", "каждый"):
             monthly = True
             if w == "каждый" and i + 1 < len(rest) and rest[i + 1].lower().startswith("месяц"):
                 i += 1
@@ -726,10 +729,11 @@ async def cmd_plan_add(message: Message, command: CommandObject) -> None:
             title.append(rest[i])
         i += 1
     name = " ".join(title) or "Без названия"
-    item_id = await asyncio.to_thread(_plan_write, planner.add_item, day, name, amount, monthly, priority)
+    item_id = await asyncio.to_thread(_plan_write, planner.add_item, day, name, amount, monthly, priority, workday)
     await message.answer(
         f"✅ #{item_id}: {day:%d.%m.%Y} {'+' if amount > 0 else '−'}{money(abs(amount))} {escape(name)}"
-        f"{' (каждый месяц)' if monthly else ''}, {planner.PRIORITY[priority]}\nПрогноз: /plan"
+        f"{' (каждый месяц)' if monthly else ''}{', в выходной — раньше, в рабочий день' if workday else ''}, "
+        f"{planner.PRIORITY[priority]}\nПрогноз: /plan"
     )
 
 
@@ -752,7 +756,8 @@ async def cmd_plan_list(message: Message) -> None:
     for it in items:
         sign = "+" if it["amount"] > 0 else "−"
         lines.append(f"#{it['id']} {it['date']:%d.%m.%Y} {sign}{money(abs(it['amount']))} {escape(it['title'])}"
-                     f"{' · каждый месяц' if it['monthly'] else ''} · {planner.PRIORITY[it['priority']]}")
+                     f"{' · каждый месяц' if it['monthly'] else ''}{' · если выходной, раньше' if it['workday'] else ''} · "
+                     f"{planner.PRIORITY[it['priority']]}")
     await message.answer("\n".join(lines))
 
 

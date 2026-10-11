@@ -35,6 +35,9 @@ DEFAULT_RESERVE = 30000.0
 
 def ensure(conn: sqlite3.Connection) -> None:
     conn.executescript(PLAN_SCHEMA)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_items)")}
+    if "workday" not in cols:                      # миграция старых баз
+        conn.execute("ALTER TABLE plan_items ADD COLUMN workday INTEGER NOT NULL DEFAULT 0")
 
 
 def get_setting(conn: sqlite3.Connection, key: str, default: float | None = None) -> float | None:
@@ -51,10 +54,10 @@ def set_setting(conn: sqlite3.Connection, key: str, value: float) -> None:
 
 
 def add_item(conn: sqlite3.Connection, day: date, title: str, amount: float, monthly: bool = False,
-             priority: int = 1) -> int:
+             priority: int = 1, workday: bool = False) -> int:
     ensure(conn)
-    cur = conn.execute("INSERT INTO plan_items (date, title, amount, monthly, priority) VALUES (?,?,?,?,?)",
-                       (day.isoformat(), title, amount, int(monthly), priority))
+    cur = conn.execute("INSERT INTO plan_items (date, title, amount, monthly, priority, workday) VALUES (?,?,?,?,?,?)",
+                       (day.isoformat(), title, amount, int(monthly), priority, int(workday)))
     conn.commit()
     return cur.lastrowid
 
@@ -68,8 +71,9 @@ def delete_item(conn: sqlite3.Connection, item_id: int) -> bool:
 
 def list_items(conn: sqlite3.Connection) -> list[dict]:
     ensure(conn)
-    return [dict(id=r[0], date=date.fromisoformat(r[1]), title=r[2], amount=r[3], monthly=bool(r[4]), priority=r[5])
-            for r in conn.execute("SELECT id, date, title, amount, monthly, priority FROM plan_items ORDER BY date, id")]
+    return [dict(id=r[0], date=date.fromisoformat(r[1]), title=r[2], amount=r[3], monthly=bool(r[4]), priority=r[5],
+                 workday=bool(r[6]))
+            for r in conn.execute("SELECT id, date, title, amount, monthly, priority, workday FROM plan_items ORDER BY date, id")]
 
 
 def _add_month(d: date, k: int) -> date:
@@ -78,16 +82,35 @@ def _add_month(d: date, k: int) -> date:
     return date(y, m, min(d.day, calendar.monthrange(y, m)[1]))
 
 
+# Нерабочие праздники по фиксированным датам (месяц, день). Переносы выходных по производственному
+# календарю не учитываются: это приближение.
+HOLIDAYS = {(1, d) for d in range(1, 9)} | {(2, 23), (3, 8), (5, 1), (5, 9), (6, 12), (11, 4)}
+
+
+def is_workday(d: date) -> bool:
+    return d.weekday() < 5 and (d.month, d.day) not in HOLIDAYS
+
+
+def shift_to_workday(d: date) -> date:
+    """Если день выходной или праздник, выплата приходит в ближайший рабочий день раньше."""
+    while not is_workday(d):
+        d -= timedelta(days=1)
+    return d
+
+
 def occurrences(item: dict, start: date, end: date) -> list[date]:
     """Даты срабатывания пункта плана в [start, end]."""
+    shift = shift_to_workday if item.get("workday") else (lambda x: x)
     if not item["monthly"]:
-        return [item["date"]] if start <= item["date"] <= end else []
+        d = shift(item["date"])
+        return [d] if start <= d <= end else []
     out, k = [], 0
     while True:
-        d = _add_month(item["date"], k)
-        if d > end:
+        base = _add_month(item["date"], k)
+        if base > end + timedelta(days=15):
             return out
-        if d >= start:
+        d = shift(base)
+        if start <= d <= end:
             out.append(d)
         k += 1
 
