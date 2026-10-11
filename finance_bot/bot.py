@@ -536,16 +536,24 @@ async def cmd_debts(message: Message, command: CommandObject) -> None:
     total_min = sum(d.min_payment for d in debts)
     lines += [f"💰 Всего долгов: <b>{money(total_debt)}</b> · обязательные платежи {money(total_min)}"]
 
+    by_rate = sorted(debts, key=lambda x: -x.interest_rate)
+    if len(by_rate) > 1:
+        order = " → ".join(f"{escape(d.name)} ({d.interest_rate:g}%)" for d in by_rate)
+        lines += ["", f"🏔 Приоритет по ставке: {order}"]
+        top = by_rate[0]
+        if top.grace_end_date and top.grace_end_date >= today:
+            lines.append(f"Пока у «{escape(top.name)}» льгота до {top.grace_end_date:%d.%m.%Y}, остальные платите по минимуму, "
+                         "свободные деньги направляйте в неё.")
     paying = [d for d in debts if d.min_payment > 0]
     if paying:
         report = avalanche_savings(paying, extra)
         base = report.baseline
-        first = report.prioritized[0]
-        lines += ["", f"🏔 «Лавина» по долгам с платежом: сначала <b>{escape(first.name)}</b> (самая высокая ставка)"]
+        names = ", ".join(escape(d.name) for d in paying)
         if base.finished:
-            lines.append(f"⏳ При текущих платежах: {months_text(base.months)}, переплата {money(base.total_interest)}")
+            lines.append(f"⏳ Только по долгам с платежом ({names}), если платить минимум: {months_text(base.months)}, "
+                         f"переплата {money(base.total_interest)}")
         else:
-            lines.append("⚠️ При текущих платежах эти долги не гасятся — увеличьте платежи.")
+            lines.append(f"⚠️ При минимальных платежах ({names}) долг не гасится — увеличьте платежи.")
         if extra > 0 and report.with_extra.finished:
             lines.append(f"⚡ С досрочным {money(extra)}: экономия {money(report.interest_saved)}, срок −{months_text(report.months_saved)}")
     lines += ["", "Изменить данные: /debt_edit · план денег и сценарии: /plan"]
