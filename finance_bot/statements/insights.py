@@ -135,6 +135,19 @@ MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1
 
 
 def _post(model: str, api_key: str, body: bytes, timeout: int) -> dict:
+    import time
+    for attempt in range(3):
+        try:
+            return _post_once(model, api_key, body, timeout)
+        except urllib.error.HTTPError:
+            raise
+        except OSError:
+            if attempt == 2:
+                raise
+            time.sleep(2)
+
+
+def _post_once(model: str, api_key: str, body: bytes, timeout: int) -> dict:
     req = urllib.request.Request(
         GEMINI_URL.format(model=model), data=body, method="POST",
         headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
@@ -194,8 +207,8 @@ def ai_advice(summary: dict, api_key: str | None = None, model: str | None = Non
         if e.code in (400, 403) and "location" in text.lower():
             raise RuntimeError("Gemini недоступен из вашего региона (включите VPN для Python/бота).") from e
         raise RuntimeError(f"Gemini вернул ошибку {e.code} (модель {model}): {text[:200]}") from e
-    except (urllib.error.URLError, TimeoutError) as e:
-        raise RuntimeError(f"Не удалось связаться с Gemini: {e}. Если вы в России — нужен VPN.") from e
+    except OSError as e:
+        raise RuntimeError(f"Связь с Gemini оборвалась ({type(e).__name__}). Обычно это VPN: проверьте, что он включён и стабилен, и повторите /advice.") from e
     try:
         return data["candidates"][0]["content"]["parts"][0]["text"].strip()
     except (KeyError, IndexError):
