@@ -179,3 +179,15 @@ class BudgetTests(unittest.TestCase):
         res = budget.auto(c, today)
         self.assertEqual(res["Продукты"], 13000.0)   # 3000 в неделю * 30,4 / 7 ≈ 13 029 -> 13 000
         self.assertEqual(budget.list_limits(c)["Продукты"], 13000.0)
+
+
+class VoiceTests(unittest.TestCase):
+    def test_parse(self):
+        from statements import voice
+        cats = ["Продукты", "Кафе и рестораны"]
+        r = voice.parse_answer('{"transcript":"первая продукты","assign":{"1":"продукты","2":"Космос","9":"Продукты"},'
+                               '"remove":[3],"unclear":""}', 3, cats)
+        self.assertEqual(r["assign"], {0: "Продукты"})
+        self.assertEqual(r["remove"], [2])
+        self.assertEqual(len(r["unknown"]), 1)
+        self.assertEqual(voice.parse_answer("не json", 3, cats)["assign"], {})
