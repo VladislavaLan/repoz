@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS tx_splits (
 );
 """
 SPEND_TYPES = ("expense", "refund")
-from .normalize import RENAMED
+from .normalize import IGNORE, RENAMED
 
 
 def ensure(conn: sqlite3.Connection) -> None:
@@ -51,8 +51,9 @@ def find_ops(conn: sqlite3.Connection, query: str, start: str | None = None, lim
     rows = conn.execute(
         f"SELECT t.fingerprint, t.date, t.amount_kop, t.merchant, t.category, COALESCE(o.planned, 0) "
         f"FROM transactions t LEFT JOIN tx_overrides o ON o.fingerprint = t.fingerprint "
-        f"WHERE t.date >= ? AND t.type IN ({','.join('?' * len(SPEND_TYPES))}) ORDER BY t.date DESC, t.id DESC",
-        (start, *SPEND_TYPES),
+        f"WHERE t.date >= ? AND (t.type IN ({','.join('?' * len(SPEND_TYPES))}) OR (t.type = 'technical' AND t.category = ?)) "
+        f"ORDER BY t.date DESC, t.id DESC",
+        (start, *SPEND_TYPES, IGNORE),
     ).fetchall()
     out = [{"fingerprint": f, "date": d, "kop": k, "merchant": m, "category": c or "Прочее", "planned": bool(p)}
            for f, d, k, m, c, p in rows if q in (m or "").casefold()]
@@ -82,7 +83,12 @@ def set_category(conn: sqlite3.Connection, fingerprints: list[str], category: st
     for fp in fingerprints:
         conn.execute("INSERT INTO tx_overrides (fingerprint, category) VALUES (?, ?) "
                      "ON CONFLICT(fingerprint) DO UPDATE SET category = excluded.category", (fp, category))
+        if category != IGNORE:      # вернули операцию из «Не считать»: снова обычная трата или возврат
+            conn.execute("UPDATE transactions SET type = CASE WHEN amount_kop < 0 THEN 'expense' ELSE 'refund' END "
+                         "WHERE fingerprint = ? AND type = 'technical' AND category = ?", (fp, IGNORE))
         conn.execute("UPDATE transactions SET category = ? WHERE fingerprint = ?", (category, fp))
+        if category == IGNORE:
+            conn.execute("UPDATE transactions SET type = 'technical' WHERE fingerprint = ? AND type IN ('expense','refund')", (fp,))
     conn.commit()
     return len(fingerprints)
 
@@ -131,6 +137,9 @@ def apply_overrides(conn: sqlite3.Connection) -> int:
         "WHERE fingerprint IN (SELECT fingerprint FROM tx_overrides WHERE category != '') "
         "AND category != (SELECT category FROM tx_overrides o WHERE o.fingerprint = transactions.fingerprint)")
     changed += cur.rowcount
+    # «Не считать» (например, тестовые платежи на проде): такие строки не входят ни в траты, ни в доходы
+    changed += conn.execute("UPDATE transactions SET type = 'technical' WHERE category = ? AND type IN ('expense','refund')",
+                            (IGNORE,)).rowcount
     conn.commit()
     return changed + apply_splits(conn)
 

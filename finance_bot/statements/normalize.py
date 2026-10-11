@@ -25,7 +25,11 @@ from . import config
 
 # Порядок важен: первое совпадение побеждает. Проверяется по названию магазина/описанию, регистр не важен.
 # Свои правила добавляйте в statements_config.json (extra_rules): они проверяются раньше этих.
+IGNORE = "Не считать (тесты)"      # служебная «категория»: операция остаётся в базе, но не входит в отчёты
+
+
 RULES: list[tuple[str, str]] = [
+    (r"ARKHIV|ARHIV|АРХИВ|ZAGS|ЗАГС", "Родословная и архивы"),
     (r"APTEK|АПТЕК|PHARM|ГОРЗДРАВ|GORZDRAV|ЗДРАВСИТИ|ЕАПТЕКА|ВИТАМИН|VITAMIN|APTEKA", "Аптека"),
     (r"ZARA|H&M|UNIQLO|ADIDAS|NIKE|ODEZHD|ОДЕЖД|OBUV|ОБУВЬ|SPORTMASTER|LAMODA|TOPFASHION", "Одежда и обувь"),
     (r"POSUD|ПОСУД|KUHN|КУХН|HOMEPLUS", "Товары для кухни"),
@@ -121,7 +125,7 @@ def all_categories() -> list[str]:
     cats |= {c for _, c in config.load().get("extra_rules", [])}
     cats |= set(config.load().get("category_aliases", {}).values())
     cats |= {"Прочее", "Развлечения", "Проценты и комиссии", "Подарки", "Наличные", "Косметика", "Одежда и обувь",
-             "Техника", "Аптека", "Ремонт", "Товары для кухни", "Прочие товары"}
+             "Техника", "Аптека", "Ремонт", "Товары для кухни", "Прочие товары", "Родословная и архивы", IGNORE}
     cats.discard("Чаевые (получено)")
     return sorted({RENAMED.get(c, c) for c in cats})
 

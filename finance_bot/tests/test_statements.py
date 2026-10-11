@@ -353,6 +353,9 @@ class CashWithdrawal(unittest.TestCase):
         self.assertNotIn("Покупки", nz.all_categories())
         self.assertEqual(nz.RENAMED.get("Покупки"), "Прочие товары")
 
+    def test_genealogy_category(self):
+        self.assertEqual(nz.categorize("ARKHIV"), "Родословная и архивы")
+
     def test_gifts_category(self):
         self.assertEqual(nz.categorize("CVETOCHNYJ SKLAD"), "Подарки")
         self.assertIn("Подарки", nz.all_categories())
@@ -449,3 +452,27 @@ class SplitOps(unittest.TestCase):
         self.assertEqual(recat.unsplit(conn, child), 2)
         found = recat.find_ops(conn, "ozon", "2026-09-01")
         self.assertEqual([(o["fingerprint"], o["category"]) for o in found], [(fp, "Прочие товары")])
+
+
+class IgnoreCategory(unittest.TestCase):
+    def test_ignored_rows_leave_the_report_and_can_be_restored(self):
+        conn = sqlite3.connect(":memory:")
+        rows = [nz.Txn("s", "t1", date(2026, 9, 3), None, -1_000, "expense", "Прочее", "LK.TEST.RU", ""),
+                nz.Txn("s", "t2", date(2026, 9, 4), None, -200_000, "expense", "Продукты", "SHOP", "")]
+        write(conn, rows)
+        recat.set_category(conn, [rows[0].fingerprint], nz.IGNORE)
+        self.assertAlmostEqual(build_report(conn, "2026-09-01")["totals"]["spend"], 2000.0)
+        write(conn, rows)                              # повторная загрузка не возвращает тест в траты
+        recat.apply_overrides(conn)
+        self.assertAlmostEqual(build_report(conn, "2026-09-01")["totals"]["spend"], 2000.0)
+        self.assertEqual(len(recat.find_ops(conn, "lk.test", "2026-09-01")), 1)     # его видно в /recat
+        recat.set_category(conn, [rows[0].fingerprint], "Прочее")
+        self.assertAlmostEqual(build_report(conn, "2026-09-01")["totals"]["spend"], 2010.0)
+
+    def test_ignore_rule_for_merchant(self):
+        conn = sqlite3.connect(":memory:")
+        rows = [nz.Txn("s", "t1", date(2026, 9, 3), None, -1_000, "expense", "Прочее", "LK.TEST.RU", ""),
+                nz.Txn("s", "t2", date(2026, 9, 4), None, -1_500, "expense", "Прочее", "LK.TEST.RU", "")]
+        write(conn, rows)
+        recat.add_rule(conn, "lk.test.ru", nz.IGNORE)
+        self.assertAlmostEqual(build_report(conn, "2026-09-01")["totals"]["spend"], 0.0)
