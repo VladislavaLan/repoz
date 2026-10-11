@@ -131,6 +131,48 @@ PROMPT = (
 )
 
 
+MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100"
+
+
+def _post(model: str, api_key: str, body: bytes, timeout: int) -> dict:
+    import time
+    for attempt in range(3):
+        try:
+            return _post_once(model, api_key, body, timeout)
+        except urllib.error.HTTPError:
+            raise
+        except OSError:
+            if attempt == 2:
+                raise
+            time.sleep(2)
+
+
+def _post_once(model: str, api_key: str, body: bytes, timeout: int) -> dict:
+    req = urllib.request.Request(
+        GEMINI_URL.format(model=model), data=body, method="POST",
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.load(resp)
+
+
+def available_models(api_key: str, timeout: int = 30) -> list[str]:
+    """Список обычных быстрых моделей gemini-N(.M)-flash, новые первыми (без omni/preview/lite/image и т.п.)."""
+    import re
+    req = urllib.request.Request(MODELS_URL, headers={"x-goog-api-key": api_key})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        models = json.load(resp).get("models", [])
+    found = []
+    for m in models:
+        if "generateContent" not in m.get("supportedGenerationMethods", []):
+            continue
+        name = m["name"].split("/", 1)[-1]
+        mt = re.fullmatch(r"gemini-(\d+(?:\.\d+)?)-flash", name)
+        if mt:
+            found.append((float(mt.group(1)), name))
+    return [n for _, n in sorted(found, reverse=True)]
+
+
 def ai_advice(summary: dict, api_key: str | None = None, model: str | None = None, timeout: int = 60) -> str:
     """Запрос к Gemini API. Бросает RuntimeError с понятным текстом."""
     api_key = api_key or os.getenv("GEMINI_API_KEY")
@@ -138,19 +180,35 @@ def ai_advice(summary: dict, api_key: str | None = None, model: str | None = Non
         raise RuntimeError("Не задан GEMINI_API_KEY в .env (ключ берут в Google AI Studio).")
     model = model or os.getenv("GEMINI_MODEL") or DEFAULT_MODEL
     body = json.dumps({"contents": [{"parts": [{"text": PROMPT + json.dumps(summary, ensure_ascii=False)}]}]}).encode()
-    req = urllib.request.Request(
-        GEMINI_URL.format(model=model), data=body, method="POST",
-        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-    )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.load(resp)
+        try:
+            data = _post(model, api_key, body, timeout)
+        except urllib.error.HTTPError as e:
+            if e.code not in (404, 429):
+                raise
+            # Модель переименована, снята или без бесплатной квоты: пробуем другие обычные flash-модели.
+            data = None
+            last = e
+            for alt in available_models(api_key):
+                if alt == model:
+                    continue
+                try:
+                    data = _post(alt, api_key, body, timeout)
+                    model = alt
+                    break
+                except urllib.error.HTTPError as e2:
+                    if e2.code not in (404, 429):
+                        raise
+                    last = e2
+            if data is None:
+                raise last
     except urllib.error.HTTPError as e:
-        if e.code in (400, 403) and b"location" in e.read().lower():
+        text = e.read().decode("utf-8", "replace")
+        if e.code in (400, 403) and "location" in text.lower():
             raise RuntimeError("Gemini недоступен из вашего региона (включите VPN для Python/бота).") from e
-        raise RuntimeError(f"Gemini вернул ошибку {e.code}. Проверьте ключ и название модели ({model}).") from e
-    except (urllib.error.URLError, TimeoutError) as e:
-        raise RuntimeError(f"Не удалось связаться с Gemini: {e}. Если вы в России — нужен VPN.") from e
+        raise RuntimeError(f"Gemini вернул ошибку {e.code} (модель {model}): {text[:200]}") from e
+    except OSError as e:
+        raise RuntimeError(f"Связь с Gemini оборвалась ({type(e).__name__}). Обычно это VPN: проверьте, что он включён и стабилен, и повторите /advice.") from e
     try:
         return data["candidates"][0]["content"]["parts"][0]["text"].strip()
     except (KeyError, IndexError):
