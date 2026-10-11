@@ -65,6 +65,25 @@ def parse_number(text: str) -> float:
     return value
 
 
+def parse_user_date(text: str) -> date:
+    """Дата в любом привычном виде: 2026-09-01, 01.09.2026, 1.9.26, 01/09/2026 или просто 01.09 (текущий год).
+    ValueError, если не получилось."""
+    t = text.strip().replace("/", ".").replace("-", ".").replace(" ", ".")
+    parts = [p for p in t.split(".") if p]
+    try:
+        nums = [int(p) for p in parts]
+    except ValueError:
+        raise ValueError("не дата") from None
+    if len(nums) == 3 and len(parts[0]) == 4:          # ГГГГ-ММ-ДД
+        return date(nums[0], nums[1], nums[2])
+    if len(nums) == 3:                                  # ДД.ММ.ГГГГ или ДД.ММ.ГГ
+        y = nums[2] + 2000 if nums[2] < 100 else nums[2]
+        return date(y, nums[1], nums[0])
+    if len(nums) == 2:                                  # ДД.ММ — текущий год
+        return date(date.today().year, nums[1], nums[0])
+    raise ValueError("не дата")
+
+
 def money(value: float) -> str:
     return f"{value:,.2f}".replace(",", " ").replace(".00", "") + " ₽"
 
@@ -85,14 +104,14 @@ HELP_TEXT = (
     "/add_expense — записать расход (бот спросит сумму, категорию и описание)\n"
     "   или сразу: <code>/add_expense 450 Еда обед в кафе</code>\n"
     "/stats — диаграмма расходов за текущий месяц\n"
-    "/report <code>[ГГГГ-ММ-ДД]</code> — отчёт по загруженным банковским выпискам\n"
+    "/report <code>[дата, напр. 01.04.2026]</code> — отчёт по загруженным банковским выпискам\n"
     "📷 Пришлите скриншот истории операций из банка — я распознаю его и предложу сохранить\n"
     "/top <code>[категория]</code> — какие магазины в категории (без названия — в «Прочее»)\n"
-    "/edit_sheet <code>[ГГГГ-ММ-ДД]</code> — вкладка в Google Таблице для массовой правки категорий; /apply_sheet — применить правки\n"
+    "/edit_sheet <code>[дата]</code> — вкладка в Google Таблице для массовой правки категорий; /apply_sheet — применить правки\n"
     "/add_category <code>[название]</code> — добавить свою категорию (убрать: /del_category)\n"
     "/recat <code>озон</code> — поправить категории у операций магазина, отметить плановые траты\n"
     "/sheet — выгрузить операции из выписок в Google Таблицу (вкладки «Выписки» и «Итоги по месяцам»)\n"
-    "/advice <code>[ГГГГ-ММ-ДД]</code> — комментарии и советы по тратам (с ключом Gemini — и от нейросети)\n\n"
+    "/advice <code>[дата]</code> — комментарии и советы по тратам (с ключом Gemini — и от нейросети)\n\n"
     "<b>Долги</b>\n"
     "/add_debt — добавить долг (пошаговый диалог)\n"
     "/debts — список долгов и порядок погашения по «Лавине»\n"
@@ -499,9 +518,9 @@ async def cmd_report(message: Message, command: CommandObject) -> None:
     start = default_start()
     if command.args:
         try:
-            start = date.fromisoformat(command.args.strip()).isoformat()
+            start = parse_user_date(command.args).isoformat()
         except ValueError:
-            await message.answer("Формат: <code>/report [ГГГГ-ММ-ДД]</code>, например <code>/report 2026-04-01</code>")
+            await message.answer("Дата вида <code>01.04.2026</code> (или 2026-04-01): <code>/report 01.04.2026</code>")
             return
     text = await asyncio.to_thread(_report_text, start)
     if text is None:
@@ -923,9 +942,9 @@ async def cmd_edit_sheet(message: Message, command: CommandObject) -> None:
     start = None
     if command.args:
         try:
-            start = date.fromisoformat(command.args.strip()).isoformat()
+            start = parse_user_date(command.args).isoformat()
         except ValueError:
-            await message.answer("Формат: <code>/edit_sheet [ГГГГ-ММ-ДД]</code>, например <code>/edit_sheet 2026-09-01</code>. "
+            await message.answer("Дата вида <code>01.09.2026</code> (или 2026-09-01): <code>/edit_sheet 01.09.2026</code>. "
                                  "Без даты возьму операции с начала прошлого месяца.")
             return
     wait = await message.answer("Готовлю вкладку для правок…")
@@ -980,9 +999,9 @@ async def cmd_advice(message: Message, command: CommandObject) -> None:
     start = default_start()
     if command.args:
         try:
-            start = date.fromisoformat(command.args.strip()).isoformat()
+            start = parse_user_date(command.args).isoformat()
         except ValueError:
-            await message.answer("Формат: <code>/advice [ГГГГ-ММ-ДД]</code>")
+            await message.answer("Дата вида <code>01.04.2026</code>: <code>/advice 01.04.2026</code>")
             return
     parts = await asyncio.to_thread(_advice_parts, start)
     if parts is None:
