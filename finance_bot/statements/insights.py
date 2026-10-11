@@ -143,18 +143,21 @@ def _post(model: str, api_key: str, body: bytes, timeout: int) -> dict:
         return json.load(resp)
 
 
-def pick_available_model(api_key: str, timeout: int = 30) -> str | None:
-    """Спрашивает у Gemini список моделей и выбирает быструю (flash) с generateContent."""
+def available_models(api_key: str, timeout: int = 30) -> list[str]:
+    """Список обычных быстрых моделей gemini-N(.M)-flash, новые первыми (без omni/preview/lite/image и т.п.)."""
+    import re
     req = urllib.request.Request(MODELS_URL, headers={"x-goog-api-key": api_key})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         models = json.load(resp).get("models", [])
-    names = [
-        m["name"].split("/", 1)[-1] for m in models
-        if "generateContent" in m.get("supportedGenerationMethods", [])
-    ]
-    flash = sorted(n for n in names if "flash" in n and "lite" not in n and "preview" not in n
-                   and "image" not in n and "tts" not in n and "live" not in n and "thinking" not in n)
-    return (flash or names or [None])[-1]
+    found = []
+    for m in models:
+        if "generateContent" not in m.get("supportedGenerationMethods", []):
+            continue
+        name = m["name"].split("/", 1)[-1]
+        mt = re.fullmatch(r"gemini-(\d+(?:\.\d+)?)-flash", name)
+        if mt:
+            found.append((float(mt.group(1)), name))
+    return [n for _, n in sorted(found, reverse=True)]
 
 
 def ai_advice(summary: dict, api_key: str | None = None, model: str | None = None, timeout: int = 60) -> str:
@@ -168,14 +171,24 @@ def ai_advice(summary: dict, api_key: str | None = None, model: str | None = Non
         try:
             data = _post(model, api_key, body, timeout)
         except urllib.error.HTTPError as e:
-            if e.code != 404:
+            if e.code not in (404, 429):
                 raise
-            # Модель переименована или снята с выдачи: подбираем доступную.
-            alt = pick_available_model(api_key)
-            if not alt or alt == model:
-                raise
-            model = alt
-            data = _post(model, api_key, body, timeout)
+            # Модель переименована, снята или без бесплатной квоты: пробуем другие обычные flash-модели.
+            data = None
+            last = e
+            for alt in available_models(api_key):
+                if alt == model:
+                    continue
+                try:
+                    data = _post(alt, api_key, body, timeout)
+                    model = alt
+                    break
+                except urllib.error.HTTPError as e2:
+                    if e2.code not in (404, 429):
+                        raise
+                    last = e2
+            if data is None:
+                raise last
     except urllib.error.HTTPError as e:
         text = e.read().decode("utf-8", "replace")
         if e.code in (400, 403) and "location" in text.lower():
