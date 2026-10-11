@@ -9,7 +9,7 @@ from datetime import date
 from matplotlib import colormaps
 from matplotlib.figure import Figure  # без pyplot: потокобезопасно и не нужен GUI
 
-from database import get_expenses_by_category
+from database import get_spend_by_category
 
 MONTHS_RU = [
     "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
@@ -75,7 +75,7 @@ def render_pie_chart(data: dict[str, float], title: str) -> bytes:
 async def build_month_chart(today: date | None = None) -> tuple[bytes | None, dict[str, float]]:
     """PNG с расходами за текущий месяц (None, если расходов нет) и сами данные."""
     start, end = month_bounds(today)
-    data = await get_expenses_by_category(start, end)
+    data = await get_spend_by_category(start, end)
     if not data:
         return None, data
     title = f"Расходы: {MONTHS_RU[start.month - 1]} {start.year}"

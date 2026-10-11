@@ -10,7 +10,7 @@ import logging
 import os
 import re
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from html import escape
 
 from dotenv import load_dotenv
@@ -33,7 +33,8 @@ import sheets_engine  # noqa: E402
 from chart_engine import build_month_chart  # noqa: E402
 from debt_engine import avalanche_savings  # noqa: E402
 from statements import config as stcfg  # noqa: E402
-from statements import edit_sheet, insights, manual, recat, screenshot, sheets_export  # noqa: E402
+from statements import edit_sheet, insights, manual, planner, recat, screenshot, sheets_export  # noqa: E402
+from statements import summary as st_summary  # noqa: E402
 from statements import normalize as nz  # noqa: E402
 from statements.importer import write as write_txns  # noqa: E402
 from statements.report import build_report, default_start, format_telegram  # noqa: E402
@@ -168,7 +169,13 @@ HELP_TEXT = (
     "/add_debt — добавить долг (пошаговый диалог)\n"
     "/debts — список долгов и порядок погашения по «Лавине»\n"
     "/debts <code>сумма</code> — плюс расчёт экономии от досрочного платежа\n"
-    "/del_debt <code>id</code> — удалить долг\n"
+    "/debt_edit <code>id поле значение</code> — поменять остаток, ставку, льготу, лимит, платёж\n"
+    "/del_debt <code>id</code> — удалить долг\n\n"
+    "<b>План денег</b>\n"
+    "/balance <code>сумма</code> — сколько денег сейчас · /reserve <code>сумма</code> — резерв\n"
+    "/plan_add <code>23.10.2026 +90000 Аванс</code> — приход или трата в плане · /plan_list · /plan_del <code>id</code>\n"
+    "/plan <code>[до даты]</code> — прогноз по дням с кредитками и дедлайнами\n"
+    "/summary — компактная сводка по месяцам и категориям (можно показать ассистенту)\n"
     "/cancel — отменить текущий диалог"
 )
 
@@ -393,23 +400,24 @@ async def debt_rate(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(rate=rate)
     await state.set_state(AddDebt.min_payment)
-    await message.answer("<b>Шаг 4/5.</b> Минимальный ежемесячный платёж в рублях:")
+    await message.answer("<b>Шаг 4/5.</b> Минимальный ежемесячный платёж в рублях (<code>0</code>, если банк пока не выставил):")
 
 
 @router.message(AddDebt.min_payment, F.text)
 async def debt_min_payment(message: Message, state: FSMContext) -> None:
     try:
-        min_payment = parse_number(message.text)
-        if min_payment <= 0:
+        raw = message.text.strip()
+        min_payment = 0.0 if raw in ("-", "—", "нет", "Нет") else parse_number(raw)
+        if min_payment < 0:
             raise ValueError
     except ValueError:
-        await message.answer("Введите положительное число, например <code>5000</code>.")
+        await message.answer("Введите число, например <code>5000</code>, или <code>0</code>, если платежа пока нет.")
         return
 
     data = await state.get_data()
     monthly_interest = data["amount"] * data["rate"] / 100 / 12
     warning = ""
-    if min_payment <= monthly_interest:
+    if 0 < min_payment <= monthly_interest:
         warning = (
             f"\n⚠️ Платёж не покрывает ежемесячные проценты (~{money(monthly_interest)}): "
             "долг будет только расти."
@@ -463,6 +471,17 @@ async def debt_non_text(message: Message) -> None:
 
 # ---------- /debts ----------
 
+def _interest_hints() -> dict[str, float]:
+    """Средние проценты в месяц по источникам из выписок (для оценки ставки)."""
+    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        return st_summary.interest_by_source(conn, default_start())
+    except sqlite3.Error:
+        return {}
+    finally:
+        conn.close()
+
+
 @router.message(Command("debts"))
 async def cmd_debts(message: Message, command: CommandObject) -> None:
     extra = 0.0
@@ -480,51 +499,105 @@ async def cmd_debts(message: Message, command: CommandObject) -> None:
         await message.answer("Долгов нет 🎉 Добавить: /add_debt")
         return
 
-    report = avalanche_savings(debts, extra)
     today = date.today()
-
-    lines = ["🏔 <b>Приоритет погашения по «Лавине»</b>", "<i>(сначала — самая высокая ставка)</i>", ""]
-    for i, d in enumerate(report.prioritized, start=1):
-        marker = "🔥" if i == 1 else f"{i}."
-        grace = ""
-        if d.grace_end_date and d.grace_end_date > today:
-            grace = f"\n    🕊 льготный период до {d.grace_end_date:%d.%m.%Y}"
-        month_closed = report.baseline.payoff_month.get(d.id)
-        closed = f", закроется через {months_text(month_closed)}" if month_closed else ""
-        lines.append(
-            f"{marker} <b>{escape(d.name)}</b> (id {d.id})\n"
-            f"    {money(d.total_amount)} · {d.interest_rate:g}% · мин. {money(d.min_payment)}{closed}{grace}"
-        )
+    hints = await asyncio.to_thread(_interest_hints)
+    lines = ["💳 <b>Долги и кредитки</b>", ""]
+    for d in sorted(debts, key=lambda x: (x.grace_end_date or date.max, -x.interest_rate)):
+        head = f"<b>{escape(d.name)}</b> (id {d.id}): {money(d.total_amount)}"
+        if d.limit_amount:
+            head += f" из {money(d.limit_amount)}, свободно {money(max(d.limit_amount - d.total_amount, 0))}"
+        lines.append(head)
+        rate = f"{d.interest_rate:g}%" if d.interest_rate else "ставка не задана"
+        pay = f"мин. платёж {money(d.min_payment)}" if d.min_payment else "мин. платёж не выставлен"
+        if d.due_date:
+            pay += f" до {d.due_date:%d.%m.%Y}"
+        lines.append(f"    {rate} · {pay}")
+        monthly = d.total_amount * d.interest_rate / 100 / 12
+        if d.interest_rate and d.total_amount:
+            lines.append(f"    стоимость долга: ≈{money(monthly)} в месяц, ≈{money(monthly * 12 / 365)} в день")
+        if d.grace_end_date and d.grace_end_date >= today:
+            days = (d.grace_end_date - today).days
+            months_left = max(days / 30.4, 0.1)
+            lines.append(
+                f"    🕊 без процентов до {d.grace_end_date:%d.%m.%Y} (осталось {days} дн.)\n"
+                f"    чтобы успеть: ≈{money(d.total_amount / months_left)} в месяц"
+            )
+            if d.interest_rate and days <= 60 and d.total_amount > 0:
+                lines.append("    ⚠️ дедлайн близко, закройте долг полностью или проценты могут начислить за весь период")
+        elif d.grace_end_date:
+            lines.append("    ⛔ льготный период закончился")
+        if d.card:
+            for src, v in hints.items():
+                if src.endswith(d.card) and v > 0 and d.total_amount:
+                    lines.append(f"    по выпискам проценты ≈{money(v)} в месяц → ≈{v * 12 / d.total_amount * 100:.1f}% годовых")
+        lines.append("")
 
     total_debt = sum(d.total_amount for d in debts)
     total_min = sum(d.min_payment for d in debts)
-    base = report.baseline
-    lines += [
-        "",
-        f"💰 Всего долгов: <b>{money(total_debt)}</b>",
-        f"📅 Ежемесячно: {money(total_min)}",
-    ]
-    if base.finished:
-        lines.append(f"⏳ Срок погашения: {months_text(base.months)}, переплата {money(base.total_interest)}")
-    else:
-        lines.append("⚠️ При текущих платежах долги не погашаются — увеличьте платежи!")
+    lines += [f"💰 Всего долгов: <b>{money(total_debt)}</b> · обязательные платежи {money(total_min)}"]
 
-    if extra > 0:
-        lines += ["", f"⚡ <b>Досрочный платёж {money(extra)}</b> → в «{escape(report.prioritized[0].name)}»"]
-        if base.finished and report.with_extra.finished:
-            lines.append(
-                f"Экономия на процентах: <b>{money(report.interest_saved)}</b>\n"
-                f"Срок сократится на {months_text(report.months_saved)} "
-                f"(до {months_text(report.with_extra.months)})"
-            )
-        elif report.with_extra.finished:
-            lines.append(f"Долги будут погашены за {months_text(report.with_extra.months)}.")
+    paying = [d for d in debts if d.min_payment > 0]
+    if paying:
+        report = avalanche_savings(paying, extra)
+        base = report.baseline
+        first = report.prioritized[0]
+        lines += ["", f"🏔 «Лавина» по долгам с платежом: сначала <b>{escape(first.name)}</b> (самая высокая ставка)"]
+        if base.finished:
+            lines.append(f"⏳ При текущих платежах: {months_text(base.months)}, переплата {money(base.total_interest)}")
         else:
-            lines.append("Даже с досрочным платежом долги не гасятся при текущих мин. платежах.")
-    else:
-        lines += ["", "💡 Рассчитать экономию от досрочного платежа: <code>/debts 10000</code>"]
-
+            lines.append("⚠️ При текущих платежах эти долги не гасятся — увеличьте платежи.")
+        if extra > 0 and report.with_extra.finished:
+            lines.append(f"⚡ С досрочным {money(extra)}: экономия {money(report.interest_saved)}, срок −{months_text(report.months_saved)}")
+    lines += ["", "Изменить данные: /debt_edit · план денег и сценарии: /plan"]
     await message.answer("\n".join(lines))
+
+
+_DEBT_FIELD_ALIAS = {
+    "остаток": "total_amount", "долг": "total_amount", "balance": "total_amount",
+    "ставка": "interest_rate", "rate": "interest_rate",
+    "платёж": "min_payment", "платеж": "min_payment", "min": "min_payment",
+    "льгота": "grace_end_date", "grace": "grace_end_date",
+    "лимит": "limit_amount", "limit": "limit_amount",
+    "срок": "due_date", "due": "due_date",
+    "карта": "card", "card": "card",
+    "название": "name", "name": "name",
+}
+_DEBT_EDIT_HELP = (
+    "Формат: <code>/debt_edit id поле значение</code>\n\n"
+    "Поля: остаток, ставка, платёж, льгота (дата), лимит, срок (дата платежа), карта (4 цифры), название.\n"
+    "Примеры:\n<code>/debt_edit 1 остаток 151381</code>\n<code>/debt_edit 1 льгота 31.01.2027</code>\n"
+    "<code>/debt_edit 2 платёж 24249,72</code>\n<code>/debt_edit 2 срок 09.11.2026</code>\n"
+    "Дата отключается значением <code>-</code>. id смотрите в /debts."
+)
+
+
+@router.message(Command("debt_edit"))
+async def cmd_debt_edit(message: Message, command: CommandObject) -> None:
+    parts = (command.args or "").split(maxsplit=2)
+    if len(parts) < 3 or not parts[0].isdigit():
+        await message.answer(_DEBT_EDIT_HELP)
+        return
+    field = _DEBT_FIELD_ALIAS.get(parts[1].lower())
+    if not field:
+        await message.answer("Не знаю такого поля.\n\n" + _DEBT_EDIT_HELP)
+        return
+    raw = parts[2].strip()
+    try:
+        if field in ("grace_end_date", "due_date"):
+            value = None if raw in ("-", "—", "нет") else parse_user_date(raw).isoformat()
+        elif field in ("card", "name"):
+            value = raw[:100]
+        else:
+            value = parse_number(raw)
+            if value < 0:
+                raise ValueError
+    except ValueError:
+        await message.answer("Не понял значение. Число или дата вида 31.01.2027.\n\n" + _DEBT_EDIT_HELP)
+        return
+    if await db.update_debt(int(parts[0]), **{field: value}):
+        await message.answer("✅ Обновлено. Смотреть: /debts")
+    else:
+        await message.answer("Долг с таким id не найден.")
 
 
 @router.message(Command("del_debt"))
@@ -542,9 +615,10 @@ async def cmd_del_debt(message: Message, command: CommandObject) -> None:
 
 @router.message(Command("stats"))
 async def cmd_stats(message: Message) -> None:
+    await asyncio.to_thread(_sync_manual)
     png, data = await build_month_chart()
     if png is None:
-        await message.answer("В этом месяце расходов пока нет. Добавить: /add_expense")
+        await message.answer("В этом месяце расходов пока нет. Загрузите выписки или добавьте трату: /add_expense")
         return
     total = sum(data.values())
     top = "\n".join(f"• {escape(cat)}: {money(val)}" for cat, val in list(data.items())[:5])
@@ -552,6 +626,166 @@ async def cmd_stats(message: Message) -> None:
         BufferedInputFile(png, filename="expenses.png"),
         caption=f"📊 Расходы за месяц: <b>{money(total)}</b>\n\nТоп категорий:\n{top}",
     )
+
+
+# ---------- /plan, /balance, /summary ----------
+
+def _plan_data():
+    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        planner.ensure(conn)
+        report = build_report(conn, default_start())
+        return (planner.list_items(conn), planner.get_setting(conn, "balance", 0.0),
+                planner.get_setting(conn, "reserve", planner.DEFAULT_RESERVE), planner.baseline_daily(report))
+    finally:
+        conn.close()
+
+
+def _plan_write(fn, *args):
+    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        planner.ensure(conn)
+        return fn(conn, *args)
+    finally:
+        conn.close()
+
+
+_PLAN_HELP = (
+    "<b>План денег</b>\n"
+    "1. Остаток на счетах сейчас: <code>/balance 21888</code>\n"
+    "2. Приходы и траты: <code>/plan_add 23.10.2026 +90000 Аванс</code>, "
+    "<code>/plan_add 06.11.2026 -100000 ЭКО</code>\n"
+    "   добавь слово «ежемесячно» для повторов, «приоритет 2» (1 неизбежно, 2 можно сдвинуть, 3 по желанию)\n"
+    "3. Резерв, который не отдавать на кредитку: <code>/reserve 30000</code>\n"
+    "4. Прогноз: <code>/plan</code> или <code>/plan 31.01.2027</code> (по какую дату считать)\n"
+    "Убрать пункт: <code>/plan_del id</code>"
+)
+
+
+@router.message(Command("balance"))
+async def cmd_balance(message: Message, command: CommandObject) -> None:
+    try:
+        value = parse_number(command.args or "")
+    except ValueError:
+        await message.answer("Формат: <code>/balance 21888</code> — сколько денег на счетах и картах сейчас (без кредитных).")
+        return
+    await asyncio.to_thread(_plan_write, planner.set_setting, "balance", value)
+    await message.answer(f"✅ Остаток: {money(value)}. Прогноз: /plan")
+
+
+@router.message(Command("reserve"))
+async def cmd_reserve(message: Message, command: CommandObject) -> None:
+    try:
+        value = parse_number(command.args or "")
+    except ValueError:
+        await message.answer("Формат: <code>/reserve 30000</code> — сколько оставлять на счёте, а не нести на кредитку.")
+        return
+    await asyncio.to_thread(_plan_write, planner.set_setting, "reserve", value)
+    await message.answer(f"✅ Резерв: {money(value)}. Прогноз: /plan")
+
+
+@router.message(Command("plan_add"))
+async def cmd_plan_add(message: Message, command: CommandObject) -> None:
+    words = (command.args or "").split()
+    if len(words) < 3:
+        await message.answer(_PLAN_HELP)
+        return
+    try:
+        day = parse_user_date(words[0])
+        raw = words[1].replace("\u00a0", "")
+        if raw[0] not in "+-−":
+            raise ValueError
+        amount = parse_number(raw.lstrip("+-−"))
+        amount = amount if raw[0] == "+" else -amount
+    except (ValueError, IndexError):
+        await message.answer("Формат: <code>/plan_add 06.11.2026 -100000 ЭКО</code> (+ приход, − трата).\n\n" + _PLAN_HELP)
+        return
+    rest = words[2:]
+    monthly = False
+    priority = 1
+    title: list[str] = []
+    i = 0
+    while i < len(rest):
+        w = rest[i].lower()
+        if w in ("ежемесячно", "каждый"):
+            monthly = True
+            if w == "каждый" and i + 1 < len(rest) and rest[i + 1].lower().startswith("месяц"):
+                i += 1
+        elif w == "приоритет" and i + 1 < len(rest) and rest[i + 1] in "123":
+            priority = int(rest[i + 1])
+            i += 1
+        else:
+            title.append(rest[i])
+        i += 1
+    name = " ".join(title) or "Без названия"
+    item_id = await asyncio.to_thread(_plan_write, planner.add_item, day, name, amount, monthly, priority)
+    await message.answer(
+        f"✅ #{item_id}: {day:%d.%m.%Y} {'+' if amount > 0 else '−'}{money(abs(amount))} {escape(name)}"
+        f"{' (каждый месяц)' if monthly else ''}, {planner.PRIORITY[priority]}\nПрогноз: /plan"
+    )
+
+
+@router.message(Command("plan_del"))
+async def cmd_plan_del(message: Message, command: CommandObject) -> None:
+    if not command.args or not command.args.strip().isdigit():
+        await message.answer("Формат: <code>/plan_del id</code> (id видны в /plan_list)")
+        return
+    ok = await asyncio.to_thread(_plan_write, planner.delete_item, int(command.args))
+    await message.answer("🗑 Удалено." if ok else "Пункт с таким id не найден.")
+
+
+@router.message(Command("plan_list"))
+async def cmd_plan_list(message: Message) -> None:
+    items = await asyncio.to_thread(_plan_write, planner.list_items)
+    if not items:
+        await message.answer(_PLAN_HELP)
+        return
+    lines = ["📝 <b>Пункты плана</b>"]
+    for it in items:
+        sign = "+" if it["amount"] > 0 else "−"
+        lines.append(f"#{it['id']} {it['date']:%d.%m.%Y} {sign}{money(abs(it['amount']))} {escape(it['title'])}"
+                     f"{' · каждый месяц' if it['monthly'] else ''} · {planner.PRIORITY[it['priority']]}")
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("plan"))
+async def cmd_plan(message: Message, command: CommandObject) -> None:
+    items, balance, reserve, daily = await asyncio.to_thread(_plan_data)
+    debts = await db.get_debts()
+    today = date.today()
+    graces = [d.grace_end_date for d in debts if d.grace_end_date and d.grace_end_date >= today]
+    end = max(graces) if graces else today + timedelta(days=60)
+    if command.args:
+        try:
+            end = parse_user_date(command.args)
+        except ValueError:
+            await message.answer("Дата вида <code>31.01.2027</code>.")
+            return
+    if end <= today:
+        await message.answer("Конечная дата должна быть позже сегодняшней.")
+        return
+    if not items and not balance:
+        await message.answer(_PLAN_HELP)
+        return
+    cards = [planner.Card(d.name, d.total_amount, d.limit_amount, d.grace_end_date, d.min_payment, d.due_date,
+                          d.interest_rate) for d in debts]
+    result = planner.simulate(items, cards, balance, today, end, daily, reserve)
+    text = planner.format_result(result, cards)
+    if daily == 0:
+        text += "\n\n⚠️ Обычные траты не посчитаны: загрузите выписки (нужны полные месяцы)."
+    await message.answer(text)
+
+
+@router.message(Command("summary"))
+async def cmd_summary(message: Message) -> None:
+    def build() -> str | None:
+        conn = sqlite3.connect(db.DB_PATH)
+        try:
+            return st_summary.build(conn)
+        finally:
+            conn.close()
+    text = await asyncio.to_thread(build)
+    await message.answer(text or "Операций из выписок пока нет.")
 
 
 # ---------- /report (банковские выписки) ----------
@@ -1350,7 +1584,12 @@ async def main() -> None:
         BotCommand(command="sheet", description="Выгрузить операции в Google Таблицу"),
         BotCommand(command="advice", description="Комментарии и советы по тратам"),
         BotCommand(command="add_debt", description="Добавить долг"),
-        BotCommand(command="debts", description="Долги и план «Лавина»"),
+        BotCommand(command="debts", description="Долги, кредитки, дедлайны"),
+        BotCommand(command="debt_edit", description="Поменять данные по долгу"),
+        BotCommand(command="plan", description="Прогноз денег по дням"),
+        BotCommand(command="plan_add", description="Добавить приход или трату в план"),
+        BotCommand(command="balance", description="Сколько денег сейчас"),
+        BotCommand(command="summary", description="Сводка по месяцам"),
         BotCommand(command="cancel", description="Отменить диалог"),
     ]
 
