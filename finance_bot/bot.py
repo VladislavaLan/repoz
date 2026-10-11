@@ -172,7 +172,7 @@ HELP_TEXT = (
     "/debt_edit <code>id поле значение</code> — поменять остаток, ставку, льготу, лимит, платёж\n"
     "/del_debt <code>id</code> — удалить долг\n\n"
     "<b>План денег</b>\n"
-    "/balance <code>сумма</code> — сколько денег сейчас · /reserve <code>сумма</code> — резерв\n"
+    "/balance <code>сумма</code> — сколько денег сейчас · /reserve <code>сумма</code> — резерв · /living <code>сумма</code> — обычные траты в месяц\n"
     "/plan_add <code>23.10.2026 +90000 Аванс</code> — приход или трата в плане · /plan_list · /plan_del <code>id</code>\n"
     "/plan <code>[до даты]</code> — прогноз по дням с кредитками и дедлайнами\n"
     "/summary — компактная сводка по месяцам и категориям (можно показать ассистенту)\n"
@@ -643,8 +643,10 @@ def _plan_data():
     try:
         planner.ensure(conn)
         report = build_report(conn, default_start())
+        living = planner.get_setting(conn, "living")
+        daily = living / 30.4 if living else planner.baseline_daily(report)
         return (planner.list_items(conn), planner.get_setting(conn, "balance", 0.0),
-                planner.get_setting(conn, "reserve", planner.DEFAULT_RESERVE), planner.baseline_daily(report))
+                planner.get_setting(conn, "reserve", planner.DEFAULT_RESERVE), daily)
     finally:
         conn.close()
 
@@ -665,6 +667,7 @@ _PLAN_HELP = (
     "<code>/plan_add 06.11.2026 -100000 ЭКО</code>\n"
     "   добавь «ежемесячно» для повторов, «рабочий» (если выходной или праздник — раньше, в рабочий день), «приоритет 2» (1 неизбежно, 2 можно сдвинуть, 3 по желанию)\n"
     "3. Резерв, который не отдавать на кредитку: <code>/reserve 30000</code>\n"
+    "   Свои обычные траты в месяц: <code>/living 110000</code> (вернуть авто: <code>/living авто</code>)\n"
     "4. Прогноз: <code>/plan</code> или <code>/plan 31.01.2027</code> (по какую дату считать)\n"
     "Убрать пункт: <code>/plan_del id</code>"
 )
@@ -690,6 +693,28 @@ async def cmd_reserve(message: Message, command: CommandObject) -> None:
         return
     await asyncio.to_thread(_plan_write, planner.set_setting, "reserve", value)
     await message.answer(f"✅ Резерв: {money(value)}. Прогноз: /plan")
+
+
+@router.message(Command("living"))
+async def cmd_living(message: Message, command: CommandObject) -> None:
+    raw = (command.args or "").strip().lower()
+    if raw in ("авто", "auto", "-"):
+        def reset(conn):
+            conn.execute("DELETE FROM plan_settings WHERE key = 'living'")
+            conn.commit()
+        await asyncio.to_thread(_plan_write, reset)
+        await message.answer("✅ Обычные траты снова считаются автоматически по выпискам. Прогноз: /plan")
+        return
+    try:
+        value = parse_number(raw)
+        if value <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Формат: <code>/living 110000</code> — сколько вы тратите в месяц на жизнь (без ЭКО и крупных разовых).\n"
+                             "Вернуть автоматический расчёт по выпискам: <code>/living авто</code>")
+        return
+    await asyncio.to_thread(_plan_write, planner.set_setting, "living", value)
+    await message.answer(f"✅ Обычные траты в плане: {money(value)} в месяц. Прогноз: /plan")
 
 
 @router.message(Command("plan_add"))
@@ -1602,6 +1627,7 @@ async def main() -> None:
         BotCommand(command="plan", description="Прогноз денег по дням"),
         BotCommand(command="plan_add", description="Добавить приход или трату в план"),
         BotCommand(command="balance", description="Сколько денег сейчас"),
+        BotCommand(command="living", description="Обычные траты в месяц для плана"),
         BotCommand(command="summary", description="Сводка по месяцам"),
         BotCommand(command="cancel", description="Отменить диалог"),
     ]
