@@ -337,6 +337,12 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class CashWithdrawal(unittest.TestCase):
+    def test_atm_mcc_is_cash_category(self):
+        self.assertEqual(nz.categorize("Alfa Iss", mcc="6011"), "Наличные")
+        self.assertIn("Наличные", nz.all_categories())
+
+
 class Recategorize(unittest.TestCase):
     def _conn(self):
         conn = sqlite3.connect(":memory:")
