@@ -431,6 +431,8 @@ class SplitOps(unittest.TestCase):
         self.assertEqual(recat.parse_split("2000 Красота, 3000 Подарки", 500_000, cats),
                          [("Красота", 200_000), ("Подарки", 300_000)])
         self.assertEqual(recat.parse_split("2 000 красота, подарки", 500_000, cats)[1], ("Подарки", 300_000))
+        with self.assertRaisesRegex(ValueError, "нет категории"):
+            recat.parse_split("2000 Продукты, 2190", 419_029, cats)
         for bad in ("2000 Красота", "2000 Красота, 2000 Подарки", "2000 Красота, 3000 Нечто", "Красота, 5000 Подарки"):
             with self.assertRaises(ValueError):
                 recat.parse_split(bad, 500_000, cats)
