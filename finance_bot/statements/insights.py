@@ -131,6 +131,32 @@ PROMPT = (
 )
 
 
+MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100"
+
+
+def _post(model: str, api_key: str, body: bytes, timeout: int) -> dict:
+    req = urllib.request.Request(
+        GEMINI_URL.format(model=model), data=body, method="POST",
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.load(resp)
+
+
+def pick_available_model(api_key: str, timeout: int = 30) -> str | None:
+    """Спрашивает у Gemini список моделей и выбирает быструю (flash) с generateContent."""
+    req = urllib.request.Request(MODELS_URL, headers={"x-goog-api-key": api_key})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        models = json.load(resp).get("models", [])
+    names = [
+        m["name"].split("/", 1)[-1] for m in models
+        if "generateContent" in m.get("supportedGenerationMethods", [])
+    ]
+    flash = sorted(n for n in names if "flash" in n and "lite" not in n and "preview" not in n
+                   and "image" not in n and "tts" not in n and "live" not in n and "thinking" not in n)
+    return (flash or names or [None])[-1]
+
+
 def ai_advice(summary: dict, api_key: str | None = None, model: str | None = None, timeout: int = 60) -> str:
     """Запрос к Gemini API. Бросает RuntimeError с понятным текстом."""
     api_key = api_key or os.getenv("GEMINI_API_KEY")
@@ -138,17 +164,23 @@ def ai_advice(summary: dict, api_key: str | None = None, model: str | None = Non
         raise RuntimeError("Не задан GEMINI_API_KEY в .env (ключ берут в Google AI Studio).")
     model = model or os.getenv("GEMINI_MODEL") or DEFAULT_MODEL
     body = json.dumps({"contents": [{"parts": [{"text": PROMPT + json.dumps(summary, ensure_ascii=False)}]}]}).encode()
-    req = urllib.request.Request(
-        GEMINI_URL.format(model=model), data=body, method="POST",
-        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-    )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.load(resp)
+        try:
+            data = _post(model, api_key, body, timeout)
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+            # Модель переименована или снята с выдачи: подбираем доступную.
+            alt = pick_available_model(api_key)
+            if not alt or alt == model:
+                raise
+            model = alt
+            data = _post(model, api_key, body, timeout)
     except urllib.error.HTTPError as e:
-        if e.code in (400, 403) and b"location" in e.read().lower():
+        text = e.read().decode("utf-8", "replace")
+        if e.code in (400, 403) and "location" in text.lower():
             raise RuntimeError("Gemini недоступен из вашего региона (включите VPN для Python/бота).") from e
-        raise RuntimeError(f"Gemini вернул ошибку {e.code}. Проверьте ключ и название модели ({model}).") from e
+        raise RuntimeError(f"Gemini вернул ошибку {e.code} (модель {model}): {text[:200]}") from e
     except (urllib.error.URLError, TimeoutError) as e:
         raise RuntimeError(f"Не удалось связаться с Gemini: {e}. Если вы в России — нужен VPN.") from e
     try:
