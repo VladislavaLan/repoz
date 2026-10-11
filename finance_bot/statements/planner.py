@@ -189,13 +189,14 @@ def simulate(items: list[dict], cards: list[Card], start_balance: float, today: 
             if amount > 0:
                 income_today = True
             bal += amount
-        if bal < 0:                                       # не хватает — берём с кредитки с льготой
+        if bal < 0:                                       # не хватает — берём с кредитки
             need = -bal
-            for c in sorted(cards, key=lambda x: (x.grace_end is None, x.grace_end or date.max)):
+            # сначала карты с беспроцентным периодом (ближайший дедлайн), потом платные карты со свободным лимитом
+            free_cards = [c for c in cards if c.grace_end and c.grace_end >= day and c.free > 0]
+            paid_cards = [c for c in cards if not (c.grace_end and c.grace_end >= day) and c.limit and c.free > 0]
+            for c in sorted(free_cards, key=lambda x: x.grace_end) + paid_cards:
                 if need <= 0:
                     break
-                if not c.grace_end or c.grace_end < day or c.free <= 0:
-                    continue
                 take = min(need, c.free)
                 c.balance += take
                 res.cards_peak[c.name] = max(res.cards_peak[c.name], c.balance)
