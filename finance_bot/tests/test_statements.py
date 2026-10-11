@@ -476,3 +476,29 @@ class IgnoreCategory(unittest.TestCase):
         write(conn, rows)
         recat.add_rule(conn, "lk.test.ru", nz.IGNORE)
         self.assertAlmostEqual(build_report(conn, "2026-09-01")["totals"]["spend"], 0.0)
+
+
+class CustomCategories(unittest.TestCase):
+    def tearDown(self):
+        nz.set_custom_categories([])
+
+    def test_add_use_and_delete(self):
+        conn = sqlite3.connect(":memory:")
+        self.assertEqual(recat.add_category(conn, "  хобби  "), ("Хобби", True))
+        self.assertIn("Хобби", nz.all_categories())
+        self.assertEqual(recat.add_category(conn, "ХОББИ"), ("Хобби", False))           # без дублей
+        self.assertEqual(recat.add_category(conn, "продукты"), ("Продукты", False))      # стандартная уже есть
+        nz.set_custom_categories([])
+        recat.load_custom(conn)                                                         # переживает перезапуск
+        self.assertIn("Хобби", nz.all_categories())
+        self.assertEqual(recat.delete_category(conn, "хобби"), "Хобби")
+        self.assertNotIn("Хобби", nz.all_categories())
+        self.assertIsNone(recat.delete_category(conn, "Продукты"))
+        for bad in ("", "1", "Ё" * 31, "12345", "а/б"):
+            with self.assertRaises(ValueError):
+                recat.add_category(conn, bad)
+
+    def test_split_accepts_custom_category(self):
+        conn = sqlite3.connect(":memory:")
+        recat.add_category(conn, "Хобби")
+        self.assertEqual(recat.parse_split("1000 Хобби, Продукты", 150_000, nz.all_categories())[0], ("Хобби", 100_000))

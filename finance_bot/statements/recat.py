@@ -21,6 +21,9 @@ CREATE TABLE IF NOT EXISTS merchant_rules (
     needle   TEXT PRIMARY KEY,      -- фрагмент названия, без учёта регистра
     category TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS custom_categories (
+    name TEXT PRIMARY KEY
+);
 CREATE TABLE IF NOT EXISTS tx_splits (
     fingerprint TEXT NOT NULL,      -- исходная операция
     idx         INTEGER NOT NULL,
@@ -249,3 +252,46 @@ def apply_splits(conn: sqlite3.Connection) -> int:
             conn.execute("DELETE FROM transactions WHERE fingerprint = ?", (fp,))
     conn.commit()
     return done
+
+
+# ---------- свои категории ----------
+
+def load_custom(conn: sqlite3.Connection) -> list[str]:
+    """Читает свои категории из базы и подключает их к списку категорий бота."""
+    from . import normalize
+    ensure(conn)
+    names = [r[0] for r in conn.execute("SELECT name FROM custom_categories ORDER BY name")]
+    normalize.set_custom_categories(names)
+    return names
+
+
+def add_category(conn: sqlite3.Connection, raw: str) -> tuple[str, bool]:
+    """Добавляет свою категорию. Возвращает (название, создана ли новая). ValueError, если название не подходит."""
+    import re
+    from . import normalize
+    name = re.sub(r"\s+", " ", raw.strip())
+    if not (2 <= len(name) <= 30) or not re.search(r"[A-Za-zА-Яа-яЁё]", name) or "/" in name or ":" in name:
+        raise ValueError("Название — от 2 до 30 символов, с буквами, без «/» и «:». Например: Хобби")
+    name = name[0].upper() + name[1:]
+    if name.casefold() == IGNORE.casefold():
+        raise ValueError("Это служебное название, придумайте другое.")
+    for existing in normalize.all_categories():
+        if existing.casefold() == name.casefold():
+            return existing, False
+    ensure(conn)
+    conn.execute("INSERT OR IGNORE INTO custom_categories (name) VALUES (?)", (name,))
+    conn.commit()
+    load_custom(conn)
+    return name, True
+
+
+def delete_category(conn: sqlite3.Connection, raw: str) -> str | None:
+    """Убирает свою категорию из списка (операции с ней остаются как есть). Возвращает название или None."""
+    ensure(conn)
+    names = {n.casefold(): n for (n,) in conn.execute("SELECT name FROM custom_categories")}
+    name = names.get(raw.strip().casefold())
+    if name:
+        conn.execute("DELETE FROM custom_categories WHERE name = ?", (name,))
+        conn.commit()
+        load_custom(conn)
+    return name

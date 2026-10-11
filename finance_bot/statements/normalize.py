@@ -119,6 +119,14 @@ def _categorize(merchant: str, mcc: str = "", bank_category: str = "") -> str:
     return "Прочее"
 
 
+_CUSTOM: set[str] = set()      # свои категории, созданные в боте (хранятся в базе, см. recat.load_custom)
+
+
+def set_custom_categories(names) -> None:
+    _CUSTOM.clear()
+    _CUSTOM.update(names)
+
+
 def all_categories() -> list[str]:
     """Известные категории (для выбора в боте)."""
     cats = {c for _, c in RULES} | set(MCC.values()) | set(SBER_CATEGORY.values())
@@ -127,6 +135,7 @@ def all_categories() -> list[str]:
     cats |= {"Прочее", "Развлечения", "Проценты и комиссии", "Подарки", "Наличные", "Косметика", "Одежда и обувь",
              "Техника", "Аптека", "Ремонт", "Товары для кухни", "Прочие товары", "Родословная и архивы", IGNORE}
     cats.discard("Чаевые (получено)")
+    cats |= _CUSTOM
     return sorted({RENAMED.get(c, c) for c in cats})
 
 

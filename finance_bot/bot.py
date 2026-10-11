@@ -88,6 +88,7 @@ HELP_TEXT = (
     "/report <code>[ГГГГ-ММ-ДД]</code> — отчёт по загруженным банковским выпискам\n"
     "📷 Пришлите скриншот истории операций из банка — я распознаю его и предложу сохранить\n"
     "/top <code>[категория]</code> — какие магазины в категории (без названия — в «Прочее»)\n"
+    "/add_category <code>[название]</code> — добавить свою категорию (убрать: /del_category)\n"
     "/recat <code>озон</code> — поправить категории у операций магазина, отметить плановые траты\n"
     "/sheet — выгрузить операции из выписок в Google Таблицу (вкладки «Выписки» и «Итоги по месяцам»)\n"
     "/advice <code>[ГГГГ-ММ-ДД]</code> — комментарии и советы по тратам (с ключом Gemini — и от нейросети)\n\n"
@@ -545,6 +546,10 @@ _recat_sessions: dict[str, dict] = {}
 
 class SplitOp(StatesGroup):
     parts = State()
+
+
+class NewCategory(StatesGroup):
+    name = State()
 _RC_PAGE = 8
 
 
@@ -596,10 +601,10 @@ def _rc_kb(token: str, p: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _rc_cat_kb(token: str) -> InlineKeyboardMarkup:
-    cats = nz.all_categories()
+def _rc_cat_kb(token: str, cats: list[str]) -> InlineKeyboardMarkup:
     btns = [InlineKeyboardButton(text=c, callback_data=f"rc:{token}:k{k}") for k, c in enumerate(cats)]
     rows = [btns[j:j + 2] for j in range(0, len(btns), 2)]
+    rows.append([InlineKeyboardButton(text="➕ Новая категория", callback_data=f"rc:{token}:nc")])
     rows.append([InlineKeyboardButton(text="← Назад", callback_data=f"rc:{token}:bk")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -666,6 +671,71 @@ async def on_top_button(cb: CallbackQuery) -> None:
         return
     await cb.answer()
     await _open_recat(cb.message, cb.from_user.id, p["names"][int(i)])
+
+
+async def _rc_choose(p: dict, token: str, cat: str) -> str | None:
+    """Применяет выбранную категорию: к отмеченным операциям или (режим «правило») ко всему магазину.
+    Для правила возвращает итоговый текст (диалог закрывается), для отмеченных — None."""
+    ops = p["ops"]
+    if p["mode"] == "rule":
+        n = await asyncio.to_thread(_rc_apply, "rule", [], (p["query"], cat))
+        _recat_sessions.pop(token, None)
+        return (f"✅ Правило сохранено: всё со словом «{escape(p['query'])}» → {escape(cat)}. "
+                f"Изменено операций: {n}.")
+    fps = [ops[i]["fingerprint"] for i in sorted(p["sel"])]
+    await asyncio.to_thread(_rc_apply, "cat", fps, cat)
+    for i in p["sel"]:
+        ops[i]["category"] = cat
+    p["sel"] = set()
+    return None
+
+
+@router.message(Command("add_category"))
+async def cmd_add_category(message: Message, command: CommandObject, state: FSMContext) -> None:
+    if not command.args:
+        await state.set_state(NewCategory.name)
+        await state.update_data(token="")
+        await message.answer("Как назвать новую категорию? Напишите название одним сообщением, например: "
+                             "<code>Хобби</code>. Отмена: /cancel")
+        return
+    await _create_category(message, state, command.args)
+
+
+@router.message(Command("del_category"))
+async def cmd_del_category(message: Message, command: CommandObject) -> None:
+    if not command.args:
+        await message.answer("Напишите название своей категории, например <code>/del_category Хобби</code>. "
+                             "Операции с ней останутся как есть, исчезнет только кнопка.")
+        return
+    name = await asyncio.to_thread(_db_call, recat.delete_category, command.args)
+    await message.answer(f"Категория «{escape(name)}» убрана из списка." if name
+                         else "Такой своей категории нет. Стандартные категории удалить нельзя.")
+
+
+@router.message(NewCategory.name, F.text, ~F.text.startswith("/"))
+async def new_category_name(message: Message, state: FSMContext) -> None:
+    await _create_category(message, state, message.text)
+
+
+async def _create_category(message: Message, state: FSMContext, raw: str) -> None:
+    data = await state.get_data()
+    try:
+        name, created = await asyncio.to_thread(_db_call, recat.add_category, raw)
+    except ValueError as e:
+        await message.answer(f"⚠️ {escape(str(e))}\nПопробуйте ещё раз или /cancel.")
+        return
+    await state.clear()
+    head = f"✅ Категория «{escape(name)}» добавлена." if created else f"Категория «{escape(name)}» уже есть."
+    p = _recat_sessions.get(data.get("token", ""))
+    if p and p["user"] == message.from_user.id:        # создавали из выбора категории: сразу применяем её
+        text = await _rc_choose(p, data["token"], name)
+        if text:
+            await message.answer(head + "\n" + text)
+            return
+        await message.answer(head + " Применила к отмеченным операциям.")
+        await message.answer(_rc_text(p), reply_markup=_rc_kb(data["token"], p))
+        return
+    await message.answer(head + " Теперь она есть в списках категорий (/recat, разбивка операций).")
 
 
 @router.message(SplitOp.parts, F.text, ~F.text.startswith("/"))
@@ -748,24 +818,26 @@ async def on_recat_button(cb: CallbackQuery, state: FSMContext) -> None:
         p["mode"] = "sel" if action == "cm" else "rule"
         title = (f"Категория для {len(p['sel'])} отмеченных операций:" if action == "cm"
                  else f"Категория для ВСЕХ трат со словом «{escape(p['query'])}» (и будущих):")
-        await cb.message.edit_text(title, reply_markup=_rc_cat_kb(token))
+        p["cats"] = nz.all_categories()           # снимок списка: кнопки не «съедут», если добавят новую категорию
+        await cb.message.edit_text(title, reply_markup=_rc_cat_kb(token, p["cats"]))
     elif action[0] == "k" and action[1:].isdigit():
-        cat = nz.all_categories()[int(action[1:])]
-        if p["mode"] == "rule":
-            n = await asyncio.to_thread(_rc_apply, "rule", [], (p["query"], cat))
-            await cb.message.edit_text(f"✅ Правило сохранено: всё со словом «{escape(p['query'])}» → {escape(cat)}. "
-                                       f"Изменено операций: {n}.")
-            _recat_sessions.pop(token, None)
+        cats = p.get("cats") or nz.all_categories()
+        if int(action[1:]) >= len(cats):
+            await cb.answer("Список устарел, откройте категории ещё раз.", show_alert=True)
+            return
+        text = await _rc_choose(p, token, cats[int(action[1:])])
+        if text:                                   # правило для магазина: диалог закрыт
+            await cb.message.edit_text(text)
             await cb.answer()
             return
-        fps = [ops[i]["fingerprint"] for i in sorted(p["sel"])]
-        await asyncio.to_thread(_rc_apply, "cat", fps, cat)
-        for i in p["sel"]:
-            ops[i]["category"] = cat
-        p["sel"] = set()
         await refresh()
-        await cb.answer(f"Готово: {len(fps)} → {cat}")
+        await cb.answer("Готово")
         return
+    elif action == "nc":
+        await state.set_state(NewCategory.name)
+        await state.update_data(token=token)
+        await cb.message.answer("Как назвать новую категорию? Напишите название одним сообщением, например: "
+                                "<code>Хобби</code>. Отмена: /cancel")
     elif action == "sp":
         if len(p["sel"]) != 1:
             await cb.answer("Отметьте ровно одну операцию, которую хотите разбить.", show_alert=True)
@@ -1024,6 +1096,10 @@ async def main() -> None:
         raise RuntimeError("Не задан BOT_TOKEN. Скопируйте .env.example в .env и укажите токен.")
 
     await db.init_db()
+    try:
+        await asyncio.to_thread(_db_call, recat.load_custom)     # свои категории из базы
+    except sqlite3.Error:
+        log.exception("Не удалось прочитать свои категории")
     moved = await asyncio.to_thread(_sync_manual)
     if moved:
         log.info("Ручные траты скопированы в общую таблицу: %s", moved)
@@ -1047,6 +1123,7 @@ async def main() -> None:
         BotCommand(command="stats", description="Диаграмма расходов за месяц"),
         BotCommand(command="report", description="Отчёт по банковским выпискам"),
         BotCommand(command="top", description="Магазины в категории (по умолчанию «Прочее»)"),
+        BotCommand(command="add_category", description="Добавить свою категорию"),
         BotCommand(command="recat", description="Поправить категории у магазина"),
         BotCommand(command="sheet", description="Выгрузить операции в Google Таблицу"),
         BotCommand(command="advice", description="Комментарии и советы по тратам"),
