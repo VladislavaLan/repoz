@@ -96,3 +96,12 @@ class DbTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkdayTests(unittest.TestCase):
+    def test_shift_and_monthly(self):
+        self.assertEqual(planner.shift_to_workday(date(2026, 10, 25)), date(2026, 10, 23))   # воскресенье -> пятница
+        self.assertEqual(planner.shift_to_workday(date(2027, 1, 10)), date(2026, 12, 31))    # январские праздники
+        it = dict(date=date(2026, 10, 25), monthly=True, workday=True)
+        days = planner.occurrences(it, date(2026, 10, 11), date(2027, 1, 31))
+        self.assertEqual(days, [date(2026, 10, 23), date(2026, 11, 25), date(2026, 12, 25), date(2027, 1, 25)])
