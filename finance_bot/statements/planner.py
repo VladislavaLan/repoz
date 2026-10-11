@@ -213,7 +213,7 @@ def simulate(items: list[dict], cards: list[Card], start_balance: float, today: 
                     c.balance -= pay
                     bal -= pay
                     surplus -= pay
-                    res.events.append((day, f"Погашение: {c.name}", -pay))
+                    res.events.append((day, f"Погашение: {c.name} (останется {rub(c.balance)})", -pay))
                 if surplus <= 0:
                     break
         if bal < res.min_balance:
@@ -266,7 +266,10 @@ def format_result(r: Result, cards: list[Card]) -> str:
         d, a = r.shortfall[0]
         L += [f"🚨 <b>Не хватает даже с кредиткой</b>: с {_d(d)}, до {rub(max(x for _, x in r.shortfall))}. "
               "Нужно сдвинуть траты или найти деньги.", ""]
-    L.append(f"Самый низкий остаток: <b>{rub(r.min_balance)}</b> ({_d(r.min_date)})")
+    if r.draws:
+        L.append(f"Свои деньги закончатся: <b>{_d(min(d for d, _, _ in r.draws))}</b>, дальше обычные траты идут с кредитки")
+    else:
+        L.append(f"Самый низкий остаток: <b>{rub(r.min_balance)}</b> ({_d(r.min_date)})")
     for c in cards:
         if c.grace_end:
             peak = r.cards_peak.get(c.name, c.balance)
