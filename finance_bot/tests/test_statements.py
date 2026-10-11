@@ -12,7 +12,7 @@ from decimal import Decimal
 
 from statements import alfa, config, sber
 from statements import normalize as nz
-from statements import insights, manual, recat, screenshot, sheets_export
+from statements import edit_sheet, insights, manual, recat, screenshot, sheets_export
 from statements.importer import dedupe, write
 from statements.report import build_report, format_telegram
 
@@ -297,9 +297,15 @@ class ManualExpenses(unittest.TestCase):
 
 
 class FakeWS:
-    def __init__(self): self.data = None; self.cleared = 0
+    id = 1
+    def __init__(self): self.data = None; self.cleared = 0; self.ranges = {}
     def clear(self): self.cleared += 1
-    def update(self, values, range_name, value_input_option): self.data = values
+    def update(self, values, range_name, value_input_option):
+        if range_name == "A1":
+            self.data = values
+        else:
+            self.ranges[range_name] = values
+    def get_all_values(self): return [[str(c) for c in r] for r in self.data]
     def freeze(self, rows): pass
     def format(self, rng, fmt): pass
 
@@ -314,6 +320,7 @@ class FakeSheet:
     def add_worksheet(self, title, rows, cols):
         self.tabs[title] = FakeWS()
         return self.tabs[title]
+    def batch_update(self, body): self.last_batch = body
 
 
 class SheetsExport(unittest.TestCase):
@@ -424,6 +431,8 @@ class SplitOps(unittest.TestCase):
         self.assertEqual(recat.parse_split("2000 Красота, 3000 Подарки", 500_000, cats),
                          [("Красота", 200_000), ("Подарки", 300_000)])
         self.assertEqual(recat.parse_split("2 000 красота, подарки", 500_000, cats)[1], ("Подарки", 300_000))
+        with self.assertRaisesRegex(ValueError, "нет категории"):
+            recat.parse_split("2000 Продукты, 2190", 419_029, cats)
         for bad in ("2000 Красота", "2000 Красота, 2000 Подарки", "2000 Красота, 3000 Нечто", "Красота, 5000 Подарки"):
             with self.assertRaises(ValueError):
                 recat.parse_split(bad, 500_000, cats)
@@ -502,3 +511,42 @@ class CustomCategories(unittest.TestCase):
         conn = sqlite3.connect(":memory:")
         recat.add_category(conn, "Хобби")
         self.assertEqual(recat.parse_split("1000 Хобби, Продукты", 150_000, nz.all_categories())[0], ("Хобби", 100_000))
+
+
+class EditSheet(unittest.TestCase):
+    def _setup(self):
+        conn = sqlite3.connect(":memory:")
+        rows = [nz.Txn("s", "oz1", date(2026, 9, 12), None, -500_000, "expense", "Прочие товары", "OZON RU", ""),
+                nz.Txn("s", "oz2", date(2026, 9, 13), None, -90_000, "expense", "Прочие товары", "OZON FRESH", ""),
+                nz.Txn("s", "kl", date(2026, 9, 14), None, -4_000_000, "expense", "Здоровье", "KLINIKA", ""),
+                nz.Txn("s", "old", date(2026, 7, 1), None, -100, "expense", "Прочее", "OLD", "")]
+        write(conn, rows)
+        sheet = FakeSheet()
+        edit_sheet.export(conn, sheet, "2026-09-01")
+        return conn, sheet, sheet.tabs[edit_sheet.TAB]
+
+    def test_export_and_apply(self):
+        conn, sheet, ws = self._setup()
+        self.assertEqual(len(ws.data), 4)                                   # шапка + 3 операции с сентября
+        self.assertEqual(ws.data[0][4], "Новая категория")
+        self.assertIn("requests", sheet.last_batch)                         # выпадающие списки заданы
+        by = {r[1]: r for r in ws.data[1:]}
+        by["OZON FRESH"][4] = "продукты"                                    # без учёта регистра
+        by["OZON RU"][6] = "2000 Красота, Подарки"                          # разбивка
+        by["KLINIKA"][5] = "да"                                             # плановая
+        by["KLINIKA"][4] = "Здоровье!"                                      # опечатка -> ошибка, остальное применится
+        stats = edit_sheet.apply(conn, sheet)
+        self.assertEqual((stats["category"], stats["split"], stats["planned"], stats["errors"]), (1, 1, 1, 1))
+        cats = {c["category"]: c["total"] for c in build_report(conn, "2026-09-01")["cats"]}
+        self.assertAlmostEqual(cats["Продукты"], 900.0)
+        self.assertAlmostEqual(cats["Красота"], 2000.0)
+        self.assertAlmostEqual(cats["Подарки"], 3000.0)
+        self.assertEqual(len(build_report(conn, "2026-09-01")["big"]), 1)   # клиника: крупная и плановая, считается один раз
+        status = ws.ranges["H2:H4"]
+        self.assertTrue(any("разбито" in r[0] for r in status))
+        self.assertTrue(any("неизвестная категория" in r[0] for r in status))
+        # повторное применение тех же данных ничего не ломает
+        write(conn, [nz.Txn("s", "oz2", date(2026, 9, 13), None, -90_000, "expense", "Прочие товары", "OZON FRESH", "")])
+        recat.apply_overrides(conn)
+        cats = {c["category"]: c["total"] for c in build_report(conn, "2026-09-01")["cats"]}
+        self.assertAlmostEqual(cats["Продукты"], 900.0)

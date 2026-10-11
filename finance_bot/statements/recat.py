@@ -170,6 +170,9 @@ def parse_split(text: str, total_kop: int, categories: list[str], aliases: dict[
     for n, chunk in enumerate(chunks):
         m = re.match(r"^(?:(?P<amt>\d{1,3}(?:[ \u00a0]\d{3})+(?:[.,]\d+)?|\d+(?:[.,]\d+)?)\s+)?(?P<cat>\D.*)$", chunk)
         if not m:
+            if re.fullmatch(r"[\d\s.,\u00a0]+", chunk):
+                raise ValueError(f"У части «{chunk}» нет категории. Напишите, например, «{chunk} Подарки» "
+                                 "или просто категорию без суммы, если это последняя часть (она получит остаток).")
             raise ValueError(f"Не поняла «{chunk}». Формат: сумма и категория, например 2000 Красота")
         cat_raw = m["cat"].strip().casefold()
         cat = names.get(cat_raw)

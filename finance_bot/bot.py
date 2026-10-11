@@ -33,7 +33,7 @@ import sheets_engine  # noqa: E402
 from chart_engine import build_month_chart  # noqa: E402
 from debt_engine import avalanche_savings  # noqa: E402
 from statements import config as stcfg  # noqa: E402
-from statements import insights, manual, recat, screenshot, sheets_export  # noqa: E402
+from statements import edit_sheet, insights, manual, recat, screenshot, sheets_export  # noqa: E402
 from statements import normalize as nz  # noqa: E402
 from statements.importer import write as write_txns  # noqa: E402
 from statements.report import build_report, default_start, format_telegram  # noqa: E402
@@ -65,6 +65,77 @@ def parse_number(text: str) -> float:
     return value
 
 
+def parse_user_date(text: str) -> date:
+    """Дата в любом привычном виде: 2026-09-01, 01.09.2026, 1.9.26, 01/09/2026 или просто 01.09 (текущий год).
+    ValueError, если не получилось."""
+    t = text.strip().replace("/", ".").replace("-", ".").replace(" ", ".")
+    parts = [p for p in t.split(".") if p]
+    try:
+        nums = [int(p) for p in parts]
+    except ValueError:
+        raise ValueError("не дата") from None
+    if len(nums) == 3 and len(parts[0]) == 4:          # ГГГГ-ММ-ДД
+        return date(nums[0], nums[1], nums[2])
+    if len(nums) == 3:                                  # ДД.ММ.ГГГГ или ДД.ММ.ГГ
+        y = nums[2] + 2000 if nums[2] < 100 else nums[2]
+        return date(y, nums[1], nums[0])
+    if len(nums) == 2:                                  # ДД.ММ — текущий год
+        return date(date.today().year, nums[1], nums[0])
+    raise ValueError("не дата")
+
+
+_MONTH_STEMS = ["январ", "феврал", "март", "апрел", "ма", "июн", "июл", "август", "сентябр", "октябр", "ноябр", "декабр"]
+
+
+def _month_of(token: str) -> int | None:
+    t = token.strip(".,").lower()
+    if t in ("май", "мая"):
+        return 5
+    for i, stem in enumerate(_MONTH_STEMS, 1):
+        if i != 5 and len(t) >= 3 and t.startswith(stem[:max(3, min(len(stem), len(t)))]) and t.startswith(stem[:3]):
+            return i
+    return None
+
+
+def parse_period(text: str) -> tuple[date, date | None]:
+    """Период для команд: «сентябрь», «сентябрь октябрь», «09.2026», «01.09.2026 30.09.2026», «с 1.9 по 30.9».
+    Возвращает (с, по); «по» = None, если указана только начальная дата. ValueError, если не поняла."""
+    import calendar
+    import re
+    t = text.strip().lower()
+    today = date.today()
+    # 1) месяцы словами (с годом или без)
+    words = re.findall(r"[а-яё]+|\d{4}", t)
+    months = [(_month_of(w), w) for w in words if not w.isdigit()]
+    months = [m for m, _ in months if m]
+    years = [int(w) for w in words if w.isdigit() and len(w) == 4]
+    if months:
+        def year_for(m: int) -> int:
+            return years[0] if years else (today.year if m <= today.month else today.year - 1)
+        first, last = months[0], months[-1]
+        y1, y2 = year_for(first), year_for(last)
+        if len(years) > 1:
+            y2 = years[-1]
+        elif last < first:
+            y2 = y1 + 1
+        return date(y1, first, 1), date(y2, last, calendar.monthrange(y2, last)[1])
+    # 2) месяц числами: 09.2026 или 2026-09
+    m = re.fullmatch(r"(\d{1,2})[./-](\d{4})", t) or None
+    if m:
+        mo, y = int(m[1]), int(m[2])
+        return date(y, mo, 1), date(y, mo, calendar.monthrange(y, mo)[1])
+    m = re.fullmatch(r"(\d{4})[./-](\d{1,2})", t)
+    if m:
+        y, mo = int(m[1]), int(m[2])
+        return date(y, mo, 1), date(y, mo, calendar.monthrange(y, mo)[1])
+    # 3) одна или две даты
+    found = re.findall(r"\d{1,4}[./-]\d{1,2}(?:[./-]\d{1,4})?", t)
+    if not found:
+        raise ValueError("не период")
+    dates = sorted(parse_user_date(x) for x in found[:2])
+    return (dates[0], dates[1]) if len(dates) == 2 else (dates[0], None)
+
+
 def money(value: float) -> str:
     return f"{value:,.2f}".replace(",", " ").replace(".00", "") + " ₽"
 
@@ -85,13 +156,14 @@ HELP_TEXT = (
     "/add_expense — записать расход (бот спросит сумму, категорию и описание)\n"
     "   или сразу: <code>/add_expense 450 Еда обед в кафе</code>\n"
     "/stats — диаграмма расходов за текущий месяц\n"
-    "/report <code>[ГГГГ-ММ-ДД]</code> — отчёт по загруженным банковским выпискам\n"
+    "/report <code>[дата, напр. 01.04.2026]</code> — отчёт по загруженным банковским выпискам\n"
     "📷 Пришлите скриншот истории операций из банка — я распознаю его и предложу сохранить\n"
     "/top <code>[категория]</code> — какие магазины в категории (без названия — в «Прочее»)\n"
+    "/edit_sheet <code>[сентябрь | 01.09.2026 30.09.2026]</code> — вкладка в Google Таблице для массовой правки категорий; /apply_sheet — применить правки\n"
     "/add_category <code>[название]</code> — добавить свою категорию (убрать: /del_category)\n"
     "/recat <code>озон</code> — поправить категории у операций магазина, отметить плановые траты\n"
     "/sheet — выгрузить операции из выписок в Google Таблицу (вкладки «Выписки» и «Итоги по месяцам»)\n"
-    "/advice <code>[ГГГГ-ММ-ДД]</code> — комментарии и советы по тратам (с ключом Gemini — и от нейросети)\n\n"
+    "/advice <code>[дата]</code> — комментарии и советы по тратам (с ключом Gemini — и от нейросети)\n\n"
     "<b>Долги</b>\n"
     "/add_debt — добавить долг (пошаговый диалог)\n"
     "/debts — список долгов и порядок погашения по «Лавине»\n"
@@ -498,9 +570,9 @@ async def cmd_report(message: Message, command: CommandObject) -> None:
     start = default_start()
     if command.args:
         try:
-            start = date.fromisoformat(command.args.strip()).isoformat()
+            start = parse_user_date(command.args).isoformat()
         except ValueError:
-            await message.answer("Формат: <code>/report [ГГГГ-ММ-ДД]</code>, например <code>/report 2026-04-01</code>")
+            await message.answer("Дата вида <code>01.04.2026</code> (или 2026-04-01): <code>/report 01.04.2026</code>")
             return
     text = await asyncio.to_thread(_report_text, start)
     if text is None:
@@ -550,6 +622,10 @@ class SplitOp(StatesGroup):
 
 class NewCategory(StatesGroup):
     name = State()
+
+
+class RecatQuery(StatesGroup):
+    query = State()
 _RC_PAGE = 8
 
 
@@ -629,12 +705,19 @@ def _d_iso(iso: str) -> str:
 
 
 @router.message(Command("recat"))
-async def cmd_recat(message: Message, command: CommandObject) -> None:
-    if not command.args or not command.args.strip():
-        await message.answer("Напишите часть названия магазина, например <code>/recat озон</code>.\n"
-                             "Названия, которые бот видит у вас в выписках, покажет команда /top.")
+async def cmd_recat(message: Message, command: CommandObject, state: FSMContext) -> None:
+    if not command.args or not command.args.strip():           # из меню: спрашиваем, что искать, и ждём ответа
+        await state.set_state(RecatQuery.query)
+        await message.answer("Часть названия магазина или получателя? Например: <code>озон</code>.\n"
+                             "Названия, которые бот видит в выписках, покажет /top. Отмена: /cancel")
         return
     await _open_recat(message, message.from_user.id, command.args.strip())
+
+
+@router.message(RecatQuery.query, F.text, ~F.text.startswith("/"))
+async def recat_query_text(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await _open_recat(message, message.from_user.id, message.text.strip())
 
 
 _top_sessions: dict[str, dict] = {}
@@ -883,6 +966,134 @@ async def on_recat_button(cb: CallbackQuery, state: FSMContext) -> None:
     await cb.answer()
 
 
+# ---------- /edit_sheet и /apply_sheet (массовая правка категорий через Google Таблицу) ----------
+
+def _edit_sheet_export(start: str | None, end: str | None = None) -> dict:
+    spreadsheet = sheets_engine.get_spreadsheet()
+    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        return edit_sheet.export(conn, spreadsheet, start, end)
+    finally:
+        conn.close()
+
+
+def _edit_sheet_apply() -> dict:
+    spreadsheet = sheets_engine.get_spreadsheet()
+    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        return edit_sheet.apply(conn, spreadsheet)
+    finally:
+        conn.close()
+
+
+class EditPeriod(StatesGroup):
+    period = State()
+
+
+def _period_kb() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text="Этот месяц", callback_data="ep:cur"),
+             InlineKeyboardButton(text="Прошлый месяц", callback_data="ep:prev")],
+            [InlineKeyboardButton(text="Прошлый и этот", callback_data="ep:both"),
+             InlineKeyboardButton(text="Всё с начала анализа", callback_data="ep:all")]]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _period_for(code: str) -> tuple[str | None, str | None]:
+    import calendar
+    t = date.today()
+    py, pm = (t.year, t.month - 1) if t.month > 1 else (t.year - 1, 12)
+    first_prev = date(py, pm, 1).isoformat()
+    last_prev = date(py, pm, calendar.monthrange(py, pm)[1]).isoformat()
+    if code == "cur":
+        return date(t.year, t.month, 1).isoformat(), None
+    if code == "prev":
+        return first_prev, last_prev
+    if code == "both":
+        return first_prev, None
+    return default_start(), None
+
+
+async def _run_edit_sheet(message: Message, start: str | None, end: str | None) -> None:
+    wait = await message.answer("Готовлю вкладку для правок…")
+    try:
+        r = await asyncio.to_thread(_edit_sheet_export, start, end)
+    except Exception as e:
+        log.exception("Не удалось выгрузить вкладку правок")
+        await wait.edit_text(f"Не получилось: {escape(type(e).__name__)}. Подробности в окне бота.")
+        return
+    await wait.edit_text(
+        f"✅ Вкладка «{edit_sheet.TAB}» готова: {r['rows']} операций, "
+        + (f"с {_d_iso(r['start'])} по {_d_iso(r['end'])}" if r.get("end") else f"с {_d_iso(r['start'])}") + ".\n\n"
+        "В таблице заполните «Новую категорию» (выбор из списка), при необходимости «Плановая» и «Разбить», "
+        "потом вернитесь и напишите /apply_sheet. Подсказка по столбцам — справа на вкладке, в столбце K.")
+
+
+PERIOD_HELP = ("Примеры: <code>сентябрь</code>, <code>сентябрь октябрь</code>, <code>09.2026</code>, "
+               "<code>01.09.2026 30.09.2026</code>, <code>01.09.2026</code> (с этой даты и дальше).")
+
+
+@router.message(Command("edit_sheet"))
+async def cmd_edit_sheet(message: Message, command: CommandObject, state: FSMContext) -> None:
+    if not sheets_engine.is_enabled():
+        await message.answer("Google Таблица не подключена (нет credentials.json или GOOGLE_SPREADSHEET_NAME в .env).")
+        return
+    if not command.args:                    # из меню: спрашиваем период кнопками или текстом и ждём
+        await state.set_state(EditPeriod.period)
+        await message.answer("За какой период подготовить вкладку для правок? Нажмите кнопку или напишите период.\n"
+                             + PERIOD_HELP + "\nОтмена: /cancel", reply_markup=_period_kb())
+        return
+    try:
+        d1, d2 = parse_period(command.args)
+    except ValueError:
+        await message.answer("Не поняла период. " + PERIOD_HELP)
+        return
+    await _run_edit_sheet(message, d1.isoformat(), d2.isoformat() if d2 else None)
+
+
+@router.message(EditPeriod.period, F.text, ~F.text.startswith("/"))
+async def edit_period_text(message: Message, state: FSMContext) -> None:
+    try:
+        d1, d2 = parse_period(message.text)
+    except ValueError:
+        await message.answer("Не поняла период. " + PERIOD_HELP + "\nИли нажмите кнопку выше. Отмена: /cancel")
+        return
+    await state.clear()
+    await _run_edit_sheet(message, d1.isoformat(), d2.isoformat() if d2 else None)
+
+
+@router.callback_query(F.data.startswith("ep:"))
+async def on_period_button(cb: CallbackQuery, state: FSMContext) -> None:
+    if _allowed and cb.from_user.id not in _allowed:
+        await cb.answer()
+        return
+    await state.clear()
+    start, end = _period_for(cb.data.split(":", 1)[1])
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await cb.answer()
+    await _run_edit_sheet(cb.message, start, end)
+
+
+@router.message(Command("apply_sheet"))
+async def cmd_apply_sheet(message: Message) -> None:
+    if not sheets_engine.is_enabled():
+        await message.answer("Google Таблица не подключена.")
+        return
+    wait = await message.answer("Читаю вкладку и применяю правки…")
+    try:
+        st = await asyncio.to_thread(_edit_sheet_apply)
+    except Exception as e:
+        log.exception("Не удалось применить правки из таблицы")
+        text = ("На таблице нет вкладки «%s». Сначала /edit_sheet." % edit_sheet.TAB
+                if type(e).__name__ == "WorksheetNotFound" else f"Не получилось: {escape(type(e).__name__)}. Подробности в окне бота.")
+        await wait.edit_text(text)
+        return
+    lines = [f"✅ Применено. Категорий изменено: {st['category']}, плановых отметок: {st['planned']}, разбивок: {st['split']}."]
+    if st["errors"]:
+        lines.append(f"⚠ Не разобрала строк: {st['errors']}. Они помечены в столбце «Результат» — исправьте и повторите /apply_sheet.")
+    lines.append("Чтобы обновить вкладки «Выписки» и «Итоги по месяцам», отправьте /sheet; новую вкладку правок получите снова через /edit_sheet.")
+    await wait.edit_text("\n".join(lines))
+
+
 # ---------- /advice (комментарии и рекомендации) ----------
 
 def _advice_parts(start: str) -> tuple[list[str], dict] | None:
@@ -901,9 +1112,9 @@ async def cmd_advice(message: Message, command: CommandObject) -> None:
     start = default_start()
     if command.args:
         try:
-            start = date.fromisoformat(command.args.strip()).isoformat()
+            start = parse_user_date(command.args).isoformat()
         except ValueError:
-            await message.answer("Формат: <code>/advice [ГГГГ-ММ-ДД]</code>")
+            await message.answer("Дата вида <code>01.04.2026</code>: <code>/advice 01.04.2026</code>")
             return
     parts = await asyncio.to_thread(_advice_parts, start)
     if parts is None:
@@ -1124,6 +1335,8 @@ async def main() -> None:
         BotCommand(command="report", description="Отчёт по банковским выпискам"),
         BotCommand(command="top", description="Магазины в категории (по умолчанию «Прочее»)"),
         BotCommand(command="add_category", description="Добавить свою категорию"),
+        BotCommand(command="edit_sheet", description="Правка категорий в Google Таблице"),
+        BotCommand(command="apply_sheet", description="Применить правки из Google Таблицы"),
         BotCommand(command="recat", description="Поправить категории у магазина"),
         BotCommand(command="sheet", description="Выгрузить операции в Google Таблицу"),
         BotCommand(command="advice", description="Комментарии и советы по тратам"),
