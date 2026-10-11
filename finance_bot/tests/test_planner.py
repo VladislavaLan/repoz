@@ -123,3 +123,27 @@ class CategoryDiveTests(unittest.TestCase):
         self.assertIn("2026-09", t)
         self.assertIn("числа покупок", t)
         self.assertIsNone(category_dive.build(c, "Кафе", "2026-09-01"))
+
+
+class WeekTests(unittest.TestCase):
+    def test_week(self):
+        import sqlite3
+        from datetime import date, timedelta
+        from statements import week
+        c = sqlite3.connect(":memory:")
+        c.execute("CREATE TABLE transactions (date TEXT, amount_kop INTEGER, type TEXT, category TEXT, merchant TEXT, fingerprint TEXT)")
+        today = date(2026, 10, 12)
+        rows = []
+        for k in range(1, 7):   # 6 обычных недель по 3000 ₽ продуктов
+            rows.append(((today - timedelta(days=7 * k)).isoformat(), -300000, "expense", "Продукты", "x", f"a{k}"))
+        rows.append((today.isoformat(), -800000, "expense", "Продукты", "x", "n1"))       # эта неделя 8000
+        rows.append((today.isoformat(), -5000000, "expense", "Техника", "x", "big"))      # крупная — вне расчёта
+        c.executemany("INSERT INTO transactions VALUES (?,?,?,?,?,?)", rows)
+        t = week.build(c, today=today)
+        self.assertIn("🔴 Продукты", t)
+        self.assertIn("обычно 3 000", t)
+        self.assertIn("Не входят в расчёт", t)
+        c2 = sqlite3.connect(":memory:")
+        c2.execute("CREATE TABLE transactions (date TEXT, amount_kop INTEGER, type TEXT, category TEXT, merchant TEXT, fingerprint TEXT)")
+        c2.execute("INSERT INTO transactions VALUES ('2026-10-10',-100000,'expense','Продукты','x','z')")
+        self.assertIn("Норма пока не считается", week.build(c2, today=today))

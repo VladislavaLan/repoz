@@ -36,6 +36,7 @@ from statements import config as stcfg  # noqa: E402
 from statements import edit_sheet, insights, manual, planner, recat, screenshot, sheets_export  # noqa: E402
 from statements import summary as st_summary  # noqa: E402
 from statements import category_dive as st_category  # noqa: E402
+from statements import week as st_week  # noqa: E402
 from statements import normalize as nz  # noqa: E402
 from statements.importer import write as write_txns  # noqa: E402
 from statements.report import build_report, default_start, format_telegram  # noqa: E402
@@ -176,6 +177,7 @@ HELP_TEXT = (
     "/balance <code>сумма</code> — сколько денег сейчас · /reserve <code>сумма</code> — резерв · /living <code>сумма</code> — обычные траты в месяц\n"
     "/plan_add <code>23.10.2026 +90000 Аванс</code> — приход или трата в плане · /plan_list · /plan_del <code>id</code>\n"
     "/plan <code>[до даты]</code> — прогноз по дням с кредитками и дедлайнами\n"
+    "/week — траты за 7 дней по категориям: где выше обычного, где в норме\n"
     "/cat <code>категория [период]</code> — разбор категории: покупки, средний чек, магазины, рост из-за цен или привычек\n"
     "/summary — компактная сводка по месяцам и категориям (можно показать ассистенту)\n"
     "/cancel — отменить текущий диалог"
@@ -851,6 +853,12 @@ async def cmd_cat(message: Message, command: CommandObject) -> None:
     text = await asyncio.to_thread(
         _db_call, st_category.build, cat, start.isoformat(), end.isoformat() if end else None)
     await message.answer(text or f"В категории «{escape(cat)}» нет трат за этот период.")
+
+
+@router.message(Command("week"))
+async def cmd_week(message: Message) -> None:
+    text = await asyncio.to_thread(_db_call, st_week.build)
+    await message.answer(text or "Операций пока нет.")
 
 
 # ---------- /report (банковские выписки) ----------
@@ -1656,6 +1664,7 @@ async def main() -> None:
         BotCommand(command="balance", description="Сколько денег сейчас"),
         BotCommand(command="living", description="Обычные траты в месяц для плана"),
         BotCommand(command="summary", description="Сводка по месяцам"),
+        BotCommand(command="week", description="Траты за неделю против обычного"),
         BotCommand(command="cat", description="Разбор категории"),
         BotCommand(command="cancel", description="Отменить диалог"),
     ]
