@@ -171,6 +171,10 @@ def main(argv: list[str] | None = None) -> int:
         for f, source, txns in loaded:
             new, upd = write(conn, txns)
             print(f"{f.name}: добавлено {new}, обновлено {upd}")
+        from .recat import apply_overrides
+        fixed = apply_overrides(conn)          # ваши ручные категории переживают повторную загрузку
+        if fixed:
+            print(f"Применены ваши правки категорий: {fixed}")
         from .screenshot import drop_screenshot_dupes
         n = drop_screenshot_dupes(conn)
         if n:
