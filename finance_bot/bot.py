@@ -986,23 +986,34 @@ def _edit_sheet_apply() -> dict:
         conn.close()
 
 
-@router.message(Command("edit_sheet"))
-async def cmd_edit_sheet(message: Message, command: CommandObject) -> None:
-    if not sheets_engine.is_enabled():
-        await message.answer("Google Таблица не подключена (нет credentials.json или GOOGLE_SPREADSHEET_NAME в .env).")
-        return
-    start = end = None
-    if command.args:
-        try:
-            d1, d2 = parse_period(command.args)
-            start, end = d1.isoformat(), (d2.isoformat() if d2 else None)
-        except ValueError:
-            await message.answer(
-                "Не поняла период. Примеры:\n<code>/edit_sheet сентябрь</code> — весь месяц\n"
-                "<code>/edit_sheet сентябрь октябрь</code> — два месяца подряд\n"
-                "<code>/edit_sheet 01.09.2026 30.09.2026</code> — свой период\n"
-                "<code>/edit_sheet 01.09.2026</code> — с этой даты и дальше\nБез параметров возьму прошлый и текущий месяцы.")
-            return
+class EditPeriod(StatesGroup):
+    period = State()
+
+
+def _period_kb() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text="Этот месяц", callback_data="ep:cur"),
+             InlineKeyboardButton(text="Прошлый месяц", callback_data="ep:prev")],
+            [InlineKeyboardButton(text="Прошлый и этот", callback_data="ep:both"),
+             InlineKeyboardButton(text="Всё с начала анализа", callback_data="ep:all")]]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _period_for(code: str) -> tuple[str | None, str | None]:
+    import calendar
+    t = date.today()
+    py, pm = (t.year, t.month - 1) if t.month > 1 else (t.year - 1, 12)
+    first_prev = date(py, pm, 1).isoformat()
+    last_prev = date(py, pm, calendar.monthrange(py, pm)[1]).isoformat()
+    if code == "cur":
+        return date(t.year, t.month, 1).isoformat(), None
+    if code == "prev":
+        return first_prev, last_prev
+    if code == "both":
+        return first_prev, None
+    return default_start(), None
+
+
+async def _run_edit_sheet(message: Message, start: str | None, end: str | None) -> None:
     wait = await message.answer("Готовлю вкладку для правок…")
     try:
         r = await asyncio.to_thread(_edit_sheet_export, start, end)
@@ -1015,6 +1026,51 @@ async def cmd_edit_sheet(message: Message, command: CommandObject) -> None:
         + (f"с {_d_iso(r['start'])} по {_d_iso(r['end'])}" if r.get("end") else f"с {_d_iso(r['start'])}") + ".\n\n"
         "В таблице заполните «Новую категорию» (выбор из списка), при необходимости «Плановая» и «Разбить», "
         "потом вернитесь и напишите /apply_sheet. Подсказка по столбцам — справа на вкладке, в столбце K.")
+
+
+PERIOD_HELP = ("Примеры: <code>сентябрь</code>, <code>сентябрь октябрь</code>, <code>09.2026</code>, "
+               "<code>01.09.2026 30.09.2026</code>, <code>01.09.2026</code> (с этой даты и дальше).")
+
+
+@router.message(Command("edit_sheet"))
+async def cmd_edit_sheet(message: Message, command: CommandObject, state: FSMContext) -> None:
+    if not sheets_engine.is_enabled():
+        await message.answer("Google Таблица не подключена (нет credentials.json или GOOGLE_SPREADSHEET_NAME в .env).")
+        return
+    if not command.args:                    # из меню: спрашиваем период кнопками или текстом и ждём
+        await state.set_state(EditPeriod.period)
+        await message.answer("За какой период подготовить вкладку для правок? Нажмите кнопку или напишите период.\n"
+                             + PERIOD_HELP + "\nОтмена: /cancel", reply_markup=_period_kb())
+        return
+    try:
+        d1, d2 = parse_period(command.args)
+    except ValueError:
+        await message.answer("Не поняла период. " + PERIOD_HELP)
+        return
+    await _run_edit_sheet(message, d1.isoformat(), d2.isoformat() if d2 else None)
+
+
+@router.message(EditPeriod.period, F.text, ~F.text.startswith("/"))
+async def edit_period_text(message: Message, state: FSMContext) -> None:
+    try:
+        d1, d2 = parse_period(message.text)
+    except ValueError:
+        await message.answer("Не поняла период. " + PERIOD_HELP + "\nИли нажмите кнопку выше. Отмена: /cancel")
+        return
+    await state.clear()
+    await _run_edit_sheet(message, d1.isoformat(), d2.isoformat() if d2 else None)
+
+
+@router.callback_query(F.data.startswith("ep:"))
+async def on_period_button(cb: CallbackQuery, state: FSMContext) -> None:
+    if _allowed and cb.from_user.id not in _allowed:
+        await cb.answer()
+        return
+    await state.clear()
+    start, end = _period_for(cb.data.split(":", 1)[1])
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await cb.answer()
+    await _run_edit_sheet(cb.message, start, end)
 
 
 @router.message(Command("apply_sheet"))
