@@ -84,6 +84,58 @@ def parse_user_date(text: str) -> date:
     raise ValueError("не дата")
 
 
+_MONTH_STEMS = ["январ", "феврал", "март", "апрел", "ма", "июн", "июл", "август", "сентябр", "октябр", "ноябр", "декабр"]
+
+
+def _month_of(token: str) -> int | None:
+    t = token.strip(".,").lower()
+    if t in ("май", "мая"):
+        return 5
+    for i, stem in enumerate(_MONTH_STEMS, 1):
+        if i != 5 and len(t) >= 3 and t.startswith(stem[:max(3, min(len(stem), len(t)))]) and t.startswith(stem[:3]):
+            return i
+    return None
+
+
+def parse_period(text: str) -> tuple[date, date | None]:
+    """Период для команд: «сентябрь», «сентябрь октябрь», «09.2026», «01.09.2026 30.09.2026», «с 1.9 по 30.9».
+    Возвращает (с, по); «по» = None, если указана только начальная дата. ValueError, если не поняла."""
+    import calendar
+    import re
+    t = text.strip().lower()
+    today = date.today()
+    # 1) месяцы словами (с годом или без)
+    words = re.findall(r"[а-яё]+|\d{4}", t)
+    months = [(_month_of(w), w) for w in words if not w.isdigit()]
+    months = [m for m, _ in months if m]
+    years = [int(w) for w in words if w.isdigit() and len(w) == 4]
+    if months:
+        def year_for(m: int) -> int:
+            return years[0] if years else (today.year if m <= today.month else today.year - 1)
+        first, last = months[0], months[-1]
+        y1, y2 = year_for(first), year_for(last)
+        if len(years) > 1:
+            y2 = years[-1]
+        elif last < first:
+            y2 = y1 + 1
+        return date(y1, first, 1), date(y2, last, calendar.monthrange(y2, last)[1])
+    # 2) месяц числами: 09.2026 или 2026-09
+    m = re.fullmatch(r"(\d{1,2})[./-](\d{4})", t) or None
+    if m:
+        mo, y = int(m[1]), int(m[2])
+        return date(y, mo, 1), date(y, mo, calendar.monthrange(y, mo)[1])
+    m = re.fullmatch(r"(\d{4})[./-](\d{1,2})", t)
+    if m:
+        y, mo = int(m[1]), int(m[2])
+        return date(y, mo, 1), date(y, mo, calendar.monthrange(y, mo)[1])
+    # 3) одна или две даты
+    found = re.findall(r"\d{1,4}[./-]\d{1,2}(?:[./-]\d{1,4})?", t)
+    if not found:
+        raise ValueError("не период")
+    dates = sorted(parse_user_date(x) for x in found[:2])
+    return (dates[0], dates[1]) if len(dates) == 2 else (dates[0], None)
+
+
 def money(value: float) -> str:
     return f"{value:,.2f}".replace(",", " ").replace(".00", "") + " ₽"
 
@@ -107,7 +159,7 @@ HELP_TEXT = (
     "/report <code>[дата, напр. 01.04.2026]</code> — отчёт по загруженным банковским выпискам\n"
     "📷 Пришлите скриншот истории операций из банка — я распознаю его и предложу сохранить\n"
     "/top <code>[категория]</code> — какие магазины в категории (без названия — в «Прочее»)\n"
-    "/edit_sheet <code>[дата]</code> — вкладка в Google Таблице для массовой правки категорий; /apply_sheet — применить правки\n"
+    "/edit_sheet <code>[сентябрь | 01.09.2026 30.09.2026]</code> — вкладка в Google Таблице для массовой правки категорий; /apply_sheet — применить правки\n"
     "/add_category <code>[название]</code> — добавить свою категорию (убрать: /del_category)\n"
     "/recat <code>озон</code> — поправить категории у операций магазина, отметить плановые траты\n"
     "/sheet — выгрузить операции из выписок в Google Таблицу (вкладки «Выписки» и «Итоги по месяцам»)\n"
@@ -916,11 +968,11 @@ async def on_recat_button(cb: CallbackQuery, state: FSMContext) -> None:
 
 # ---------- /edit_sheet и /apply_sheet (массовая правка категорий через Google Таблицу) ----------
 
-def _edit_sheet_export(start: str | None) -> dict:
+def _edit_sheet_export(start: str | None, end: str | None = None) -> dict:
     spreadsheet = sheets_engine.get_spreadsheet()
     conn = sqlite3.connect(db.DB_PATH)
     try:
-        return edit_sheet.export(conn, spreadsheet, start)
+        return edit_sheet.export(conn, spreadsheet, start, end)
     finally:
         conn.close()
 
@@ -939,23 +991,28 @@ async def cmd_edit_sheet(message: Message, command: CommandObject) -> None:
     if not sheets_engine.is_enabled():
         await message.answer("Google Таблица не подключена (нет credentials.json или GOOGLE_SPREADSHEET_NAME в .env).")
         return
-    start = None
+    start = end = None
     if command.args:
         try:
-            start = parse_user_date(command.args).isoformat()
+            d1, d2 = parse_period(command.args)
+            start, end = d1.isoformat(), (d2.isoformat() if d2 else None)
         except ValueError:
-            await message.answer("Дата вида <code>01.09.2026</code> (или 2026-09-01): <code>/edit_sheet 01.09.2026</code>. "
-                                 "Без даты возьму операции с начала прошлого месяца.")
+            await message.answer(
+                "Не поняла период. Примеры:\n<code>/edit_sheet сентябрь</code> — весь месяц\n"
+                "<code>/edit_sheet сентябрь октябрь</code> — два месяца подряд\n"
+                "<code>/edit_sheet 01.09.2026 30.09.2026</code> — свой период\n"
+                "<code>/edit_sheet 01.09.2026</code> — с этой даты и дальше\nБез параметров возьму прошлый и текущий месяцы.")
             return
     wait = await message.answer("Готовлю вкладку для правок…")
     try:
-        r = await asyncio.to_thread(_edit_sheet_export, start)
+        r = await asyncio.to_thread(_edit_sheet_export, start, end)
     except Exception as e:
         log.exception("Не удалось выгрузить вкладку правок")
         await wait.edit_text(f"Не получилось: {escape(type(e).__name__)}. Подробности в окне бота.")
         return
     await wait.edit_text(
-        f"✅ Вкладка «{edit_sheet.TAB}» готова: {r['rows']} операций с {_d_iso(r['start'])}.\n\n"
+        f"✅ Вкладка «{edit_sheet.TAB}» готова: {r['rows']} операций, "
+        + (f"с {_d_iso(r['start'])} по {_d_iso(r['end'])}" if r.get("end") else f"с {_d_iso(r['start'])}") + ".\n\n"
         "В таблице заполните «Новую категорию» (выбор из списка), при необходимости «Плановая» и «Разбить», "
         "потом вернитесь и напишите /apply_sheet. Подсказка по столбцам — справа на вкладке, в столбце K.")
 

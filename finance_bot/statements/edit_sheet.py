@@ -35,8 +35,8 @@ def default_start(today: date | None = None) -> str:
     return date(y, m, 1).isoformat()
 
 
-def build_rows(conn: sqlite3.Connection, start: str) -> list[list]:
-    ops = recat.find_ops(conn, "", start, limit=20000)
+def build_rows(conn: sqlite3.Connection, start: str, end: str | None = None) -> list[list]:
+    ops = [o for o in recat.find_ops(conn, "", start, limit=20000) if not end or o["date"] <= end]
     rows = [HEADER]
     for o in ops:
         rows.append([o["date"], o["merchant"], round(o["kop"] / 100.0, 2), o["category"], "",
@@ -68,9 +68,9 @@ def _decorate(ws, spreadsheet, n_rows: int, cats: list[str]) -> None:
         pass
 
 
-def export(conn: sqlite3.Connection, spreadsheet, start: str | None = None) -> dict:
+def export(conn: sqlite3.Connection, spreadsheet, start: str | None = None, end: str | None = None) -> dict:
     start = start or default_start()
-    rows = build_rows(conn, start)
+    rows = build_rows(conn, start, end)
     try:
         ws = spreadsheet.worksheet(TAB)
     except Exception:
@@ -79,7 +79,7 @@ def export(conn: sqlite3.Connection, spreadsheet, start: str | None = None) -> d
     ws.update(values=rows, range_name="A1", value_input_option="USER_ENTERED")
     ws.update(values=[[t] for t in HELP], range_name="K1", value_input_option="USER_ENTERED")
     _decorate(ws, spreadsheet, len(rows), nz.all_categories())
-    return {"rows": len(rows) - 1, "start": start, "url": getattr(spreadsheet, "url", "")}
+    return {"rows": len(rows) - 1, "start": start, "end": end, "url": getattr(spreadsheet, "url", "")}
 
 
 def _resolve(raw: str, cats: list[str], aliases: dict[str, str]) -> str | None:
