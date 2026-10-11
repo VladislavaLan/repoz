@@ -26,8 +26,14 @@ from . import config
 # Порядок важен: первое совпадение побеждает. Проверяется по названию магазина/описанию, регистр не важен.
 # Свои правила добавляйте в statements_config.json (extra_rules): они проверяются раньше этих.
 RULES: list[tuple[str, str]] = [
+    (r"APTEK|АПТЕК|PHARM|ГОРЗДРАВ|GORZDRAV|ЗДРАВСИТИ|ЕАПТЕКА|ВИТАМИН|VITAMIN|APTEKA", "Аптека"),
+    (r"ZARA|H&M|UNIQLO|ADIDAS|NIKE|ODEZHD|ОДЕЖД|OBUV|ОБУВЬ|SPORTMASTER|LAMODA|TOPFASHION", "Одежда и обувь"),
+    (r"POSUD|ПОСУД|KUHN|КУХН|HOMEPLUS", "Товары для кухни"),
+    (r"LEROY|LEROI|ЛЕРУА|OBI\b|ОБИ\b|CASTORAMA|PETROVICH|ПЕТРОВИЧ|REMONT|РЕМОНТ|STROY|СТРОЙ", "Ремонт"),
+    (r"DNS|М\.?ВИДЕО|MVIDEO|ELDORADO|ЭЛЬДОРАДО|CITILINK|СИТИЛИНК|RE:STORE|RESTORE|TEHNOPARK|TECHNOPARK", "Техника"),
+    (r"GOLDEN APPLE|ЗОЛОТОЕ ЯБЛОКО|LETUAL|ЛЭТУАЛЬ|RIVE GAUCHE|РИВ ГОШ|SEPHORA|ПОДРУЖКА|PODRUZHKA|KOSMET|КОСМЕТ", "Косметика"),
     (r"CVETOCH|CVETY|ЦВЕТОЧН|ЦВЕТЫ|FLOWER|BUKET|БУКЕТ|PODAROK|ПОДАРОК|PODARKI|ПОДАРКИ", "Подарки"),
-    (r"OZON|WILDBERRIES|\bWB\b|ALIEXPRESS|LAMODA|TOPFASHION|MARKETPLACE", "Покупки"),
+    (r"OZON|WILDBERRIES|\bWB\b|ALIEXPRESS|LAMODA|TOPFASHION|MARKETPLACE", "Прочие товары"),
     (r"ZOOSALON|ЗООМАГ|PETSHOP|VETERIN|ВЕТКЛИНИК", "Питомцы"),
     (r"YANDEX\s*4121|YANDEX GO|\bUBER\b|CITYMOBIL|\bRZD\b|РЖД|AVTOBUS|ПЕТЕРБУРГСКИЙ МЕТРО|\bМЕТРО\b|ТРАНСПОРТА",
      "Транспорт"),
@@ -36,7 +42,7 @@ RULES: list[tuple[str, str]] = [
     (r"ЕИРЦ|EIRC|ЖКХ|ЖКУ|\bУК\b|КОММУНАЛ|ТСЖ", "Дом и ЖКХ"),
     (r"AVIASALES|ONETWOTRIP|TRIP\.COM|OSTROVOK|\bTUTU\b|BOOKING|AIRBNB|AEROFLOT|\bS7\b", "Путешествия"),
     (r"PARIKMAHER|SALON|BEAUTY|\bNAIL|BARBER|BROW", "Красота"),
-    (r"GBUZ|CLINIC|КЛИНИК|APTEK|АПТЕК|PHARM|STOMAT|ЛАБОРАТОР", "Здоровье"),
+    (r"GBUZ|CLINIC|КЛИНИК|STOMAT|ЛАБОРАТОР", "Здоровье"),
     (r"KAFE|CAFE|BISTRO|PEKARNYA|ПЕКАРНЯ|COFFEE|KOFE|BREAD|RESTORAN|PIZZ|SUSHI|BURGER|KFC|MCDONALD|STARBUCKS|"
      r"EATANDSPLIT", "Кафе и рестораны"),
     (r"LAVKA|SAMOKAT|SAMO\b|\b5411\b|\*5411\*|PYATEROCHKA|PJATEROCHKA|LENTA|MAGNIT|PEREKRESTOK|VKUSVILL|DIXY|"
@@ -50,7 +56,7 @@ SBER_CATEGORY = {
     "Путешествия": "Путешествия",
     "Здоровье и красота": "Здоровье",
     "Коммунальные платежи, связь, интернет.": "Дом и ЖКХ",
-    "Все для дома": "Покупки",
+    "Все для дома": "Прочие товары",
 }
 
 
@@ -66,24 +72,37 @@ def _mcc_map() -> dict[str, str]:
     put("Кафе и рестораны", "5811", "5812", "5813", "5814")
     put("Транспорт", "4111", "4112", "4121", "4131", "4784", "4789", "5541", "5542", "7523", "4011", "3990", "3991")
     put("Путешествия", "4511", "4722", "7011", "4411", "4582", "7012", range(3000, 3300), range(3500, 3800))
-    put("Здоровье", "8011", "8021", "8031", "8041", "8042", "8043", "8049", "8050", "8062", "8071", "8099", "5912",
-        "5122")
-    put("Красота", "7230", "7297", "7298", "5977")
+    put("Здоровье", "8011", "8021", "8031", "8041", "8042", "8043", "8049", "8050", "8062", "8071", "8099", "5122")
+    put("Аптека", "5912")
+    put("Красота", "7230", "7297", "7298")
+    put("Косметика", "5977")
     put("Наличные", "6010", "6011")        # снятие в банкомате: куда ушли деньги, выписка не знает
     put("Питомцы", "5995", "0742")
     put("Связь и подписки", "4814", "4899", "5815", "5816", "5817", "5818", "7372")
     put("Дом и ЖКХ", "4900", "6513")
     put("Развлечения", "7832", "7922", "7929", "7991", "7996", "7999", "5735", "5970")
-    put("Покупки", "5311", "5300", "5651", "5691", "5699", "5732", "5734", "5945", "5942", "5947", "5999", "5200",
-        "5712", "5719", "5722", "5211", "5231", "5251", "5631", "5661", "5611", "5621", "5655", "5948", "5964", "5965",
-        "5969", "5310", "5331", "5399")
+    put("Одежда и обувь", "5611", "5621", "5631", "5651", "5655", "5661", "5681", "5691", "5697", "5698", "5699",
+        "5137", "5139")
+    put("Техника", "5732", "5734", "5722", "5045", "5946")
+    put("Ремонт", "5200", "5211", "5231", "5251", "5039", "5072", "1520", "1711", "1731", "1740", "1750", "1761", "1771")
+    put("Товары для кухни", "5719")
+    put("Прочие товары", "5311", "5300", "5945", "5942", "5947", "5999", "5712", "5948", "5964", "5965", "5969",
+        "5310", "5331", "5399")
     return m
 
 
 MCC = _mcc_map()
 
 
+RENAMED = {"Покупки": "Прочие товары"}      # старое название категории -> новое (в том числе в ваших extra_rules)
+
+
 def categorize(merchant: str, mcc: str = "", bank_category: str = "") -> str:
+    cat = _categorize(merchant, mcc, bank_category)
+    return RENAMED.get(cat, cat)
+
+
+def _categorize(merchant: str, mcc: str = "", bank_category: str = "") -> str:
     text = merchant.upper()
     rules = [(rx, cat) for rx, cat in config.load().get("extra_rules", [])] + RULES
     for rx, cat in rules:
@@ -101,9 +120,10 @@ def all_categories() -> list[str]:
     cats = {c for _, c in RULES} | set(MCC.values()) | set(SBER_CATEGORY.values())
     cats |= {c for _, c in config.load().get("extra_rules", [])}
     cats |= set(config.load().get("category_aliases", {}).values())
-    cats |= {"Прочее", "Развлечения", "Проценты и комиссии", "Подарки", "Наличные"}
+    cats |= {"Прочее", "Развлечения", "Проценты и комиссии", "Подарки", "Наличные", "Косметика", "Одежда и обувь",
+             "Техника", "Аптека", "Ремонт", "Товары для кухни", "Прочие товары"}
     cats.discard("Чаевые (получено)")
-    return sorted(cats)
+    return sorted({RENAMED.get(c, c) for c in cats})
 
 
 @dataclass

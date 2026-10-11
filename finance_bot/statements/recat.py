@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS tx_splits (
 );
 """
 SPEND_TYPES = ("expense", "refund")
+from .normalize import RENAMED
 
 
 def ensure(conn: sqlite3.Connection) -> None:
@@ -110,6 +111,9 @@ def apply_overrides(conn: sqlite3.Connection) -> int:
         return 0
     ensure(conn)
     changed = 0
+    for old, new in RENAMED.items():              # категория «Покупки» переименована в «Прочие товары»
+        for table in ("tx_overrides", "merchant_rules", "tx_splits"):
+            conn.execute(f"UPDATE {table} SET category = ? WHERE category = ?", (new, old))
     rules = conn.execute("SELECT needle, category FROM merchant_rules").fetchall()
     if rules:
         for id_, merchant, cat in conn.execute(

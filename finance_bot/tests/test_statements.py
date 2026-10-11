@@ -81,7 +81,7 @@ class Categories(unittest.TestCase):
         config.reset()
 
     def test_keywords_mcc_and_bank_category(self):
-        self.assertEqual(nz.categorize("MOSCOW OZON"), "Покупки")
+        self.assertEqual(nz.categorize("MOSCOW OZON"), "Прочие товары")
         self.assertEqual(nz.categorize("YANDEX*5411*LAVKA"), "Продукты")
         self.assertEqual(nz.categorize("UNKNOWN SHOP", mcc="5814"), "Кафе и рестораны")
         self.assertEqual(nz.categorize("UNKNOWN SHOP", bank_category="Транспорт"), "Транспорт")
@@ -342,6 +342,17 @@ class CashWithdrawal(unittest.TestCase):
         self.assertEqual(nz.categorize("Alfa Iss", mcc="6011"), "Наличные")
         self.assertIn("Наличные", nz.all_categories())
 
+    def test_product_categories(self):
+        for merchant, mcc, want in [("GORZDRAV", "5912", "Аптека"), ("ZARA", "5651", "Одежда и обувь"),
+                                    ("DNS SHOP", "5732", "Техника"), ("LEROY MERLIN", "5200", "Ремонт"),
+                                    ("GOLDEN APPLE", "5977", "Косметика"), ("OZON RU", "5300", "Прочие товары"),
+                                    ("SOME SHOP", "5719", "Товары для кухни"), ("KLINIKA", "8099", "Здоровье")]:
+            self.assertEqual(nz.categorize(merchant, mcc=mcc), want, merchant)
+
+    def test_old_category_name_is_renamed(self):
+        self.assertNotIn("Покупки", nz.all_categories())
+        self.assertEqual(nz.RENAMED.get("Покупки"), "Прочие товары")
+
     def test_gifts_category(self):
         self.assertEqual(nz.categorize("CVETOCHNYJ SKLAD"), "Подарки")
         self.assertIn("Подарки", nz.all_categories())
@@ -351,9 +362,9 @@ class Recategorize(unittest.TestCase):
     def _conn(self):
         conn = sqlite3.connect(":memory:")
         rows = [
-            nz.Txn("s", "o1", date(2026, 9, 1), None, -150_000, "expense", "Покупки", "OZON RU", ""),
-            nz.Txn("s", "o2", date(2026, 9, 5), None, -250_000, "expense", "Покупки", "OZON RU", ""),
-            nz.Txn("s", "o3", date(2026, 9, 9), None, -90_000, "expense", "Покупки", "OZON FRESH", ""),
+            nz.Txn("s", "o1", date(2026, 9, 1), None, -150_000, "expense", "Прочие товары", "OZON RU", ""),
+            nz.Txn("s", "o2", date(2026, 9, 5), None, -250_000, "expense", "Прочие товары", "OZON RU", ""),
+            nz.Txn("s", "o3", date(2026, 9, 9), None, -90_000, "expense", "Прочие товары", "OZON FRESH", ""),
             nz.Txn("s", "k1", date(2026, 9, 7), None, -500_000, "expense", "Здоровье", "KLINIKA", ""),
             nz.Txn("s", "in", date(2026, 9, 2), None, 9_000_000, "income", "Зарплата", "", ""),
         ]
@@ -364,7 +375,7 @@ class Recategorize(unittest.TestCase):
         conn, _ = self._conn()
         found = recat.find_ops(conn, "ozon", "2026-09-01")
         self.assertEqual([o["fingerprint"] for o in found], [r.fingerprint for r in (self._conn()[1][2], self._conn()[1][1], self._conn()[1][0])])
-        top = recat.top_merchants(conn, "Покупки", "2026-09-01")
+        top = recat.top_merchants(conn, "Прочие товары", "2026-09-01")
         self.assertEqual(top[0][0], "OZON RU")
         self.assertAlmostEqual(top[0][1], 4000.0)
 
@@ -400,7 +411,7 @@ class Recategorize(unittest.TestCase):
 class SplitOps(unittest.TestCase):
     def _conn(self):
         conn = sqlite3.connect(":memory:")
-        rows = [nz.Txn("s", "oz", date(2026, 9, 12), None, -500_000, "expense", "Покупки", "OZON RU", ""),
+        rows = [nz.Txn("s", "oz", date(2026, 9, 12), None, -500_000, "expense", "Прочие товары", "OZON RU", ""),
                 nz.Txn("s", "in", date(2026, 9, 2), None, 9_000_000, "income", "Зарплата", "", "")]
         write(conn, rows)
         return conn, rows
@@ -421,7 +432,7 @@ class SplitOps(unittest.TestCase):
         cats = {c["category"]: c["total"] for c in rep["cats"]}
         self.assertAlmostEqual(cats["Красота"], 2000.0)
         self.assertAlmostEqual(cats["Подарки"], 3000.0)
-        self.assertNotIn("Покупки", cats)
+        self.assertNotIn("Прочие товары", cats)
         self.assertAlmostEqual(rep["totals"]["spend"], 5000.0)         # общая сумма не меняется
         write(conn, rows)                                               # повторная загрузка выписки
         recat.apply_overrides(conn)
@@ -437,4 +448,4 @@ class SplitOps(unittest.TestCase):
         child = recat.find_ops(conn, "ozon", "2026-09-01")[0]["fingerprint"]
         self.assertEqual(recat.unsplit(conn, child), 2)
         found = recat.find_ops(conn, "ozon", "2026-09-01")
-        self.assertEqual([(o["fingerprint"], o["category"]) for o in found], [(fp, "Покупки")])
+        self.assertEqual([(o["fingerprint"], o["category"]) for o in found], [(fp, "Прочие товары")])
