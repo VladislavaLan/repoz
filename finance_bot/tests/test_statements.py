@@ -342,6 +342,10 @@ class CashWithdrawal(unittest.TestCase):
         self.assertEqual(nz.categorize("Alfa Iss", mcc="6011"), "Наличные")
         self.assertIn("Наличные", nz.all_categories())
 
+    def test_gifts_category(self):
+        self.assertEqual(nz.categorize("CVETOCHNYJ SKLAD"), "Подарки")
+        self.assertIn("Подарки", nz.all_categories())
+
 
 class Recategorize(unittest.TestCase):
     def _conn(self):

@@ -26,6 +26,7 @@ from . import config
 # Порядок важен: первое совпадение побеждает. Проверяется по названию магазина/описанию, регистр не важен.
 # Свои правила добавляйте в statements_config.json (extra_rules): они проверяются раньше этих.
 RULES: list[tuple[str, str]] = [
+    (r"CVETOCH|CVETY|ЦВЕТОЧН|ЦВЕТЫ|FLOWER|BUKET|БУКЕТ|PODAROK|ПОДАРОК|PODARKI|ПОДАРКИ", "Подарки"),
     (r"OZON|WILDBERRIES|\bWB\b|ALIEXPRESS|LAMODA|TOPFASHION|MARKETPLACE", "Покупки"),
     (r"ZOOSALON|ЗООМАГ|PETSHOP|VETERIN|ВЕТКЛИНИК", "Питомцы"),
     (r"YANDEX\s*4121|YANDEX GO|\bUBER\b|CITYMOBIL|\bRZD\b|РЖД|AVTOBUS|ПЕТЕРБУРГСКИЙ МЕТРО|\bМЕТРО\b|ТРАНСПОРТА",
@@ -100,7 +101,7 @@ def all_categories() -> list[str]:
     cats = {c for _, c in RULES} | set(MCC.values()) | set(SBER_CATEGORY.values())
     cats |= {c for _, c in config.load().get("extra_rules", [])}
     cats |= set(config.load().get("category_aliases", {}).values())
-    cats |= {"Прочее", "Развлечения", "Проценты и комиссии"}
+    cats |= {"Прочее", "Развлечения", "Проценты и комиссии", "Подарки", "Наличные"}
     cats.discard("Чаевые (получено)")
     return sorted(cats)
 
