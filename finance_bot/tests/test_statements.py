@@ -395,3 +395,46 @@ class Recategorize(unittest.TestCase):
         self.assertAlmostEqual(health["total"], 5000.0)
         self.assertAlmostEqual(health["no_big_total"], 0.0)
         self.assertIn("плановые", format_telegram(rep))
+
+
+class SplitOps(unittest.TestCase):
+    def _conn(self):
+        conn = sqlite3.connect(":memory:")
+        rows = [nz.Txn("s", "oz", date(2026, 9, 12), None, -500_000, "expense", "Покупки", "OZON RU", ""),
+                nz.Txn("s", "in", date(2026, 9, 2), None, 9_000_000, "income", "Зарплата", "", "")]
+        write(conn, rows)
+        return conn, rows
+
+    def test_parse(self):
+        cats = nz.all_categories()
+        self.assertEqual(recat.parse_split("2000 Красота, 3000 Подарки", 500_000, cats),
+                         [("Красота", 200_000), ("Подарки", 300_000)])
+        self.assertEqual(recat.parse_split("2 000 красота, подарки", 500_000, cats)[1], ("Подарки", 300_000))
+        for bad in ("2000 Красота", "2000 Красота, 2000 Подарки", "2000 Красота, 3000 Нечто", "Красота, 5000 Подарки"):
+            with self.assertRaises(ValueError):
+                recat.parse_split(bad, 500_000, cats)
+
+    def test_split_report_and_reimport(self):
+        conn, rows = self._conn()
+        recat.split(conn, "%s" % rows[0].fingerprint, [("Красота", 200_000), ("Подарки", 300_000)])
+        rep = build_report(conn, "2026-09-01")
+        cats = {c["category"]: c["total"] for c in rep["cats"]}
+        self.assertAlmostEqual(cats["Красота"], 2000.0)
+        self.assertAlmostEqual(cats["Подарки"], 3000.0)
+        self.assertNotIn("Покупки", cats)
+        self.assertAlmostEqual(rep["totals"]["spend"], 5000.0)         # общая сумма не меняется
+        write(conn, rows)                                               # повторная загрузка выписки
+        recat.apply_overrides(conn)
+        self.assertAlmostEqual(build_report(conn, "2026-09-01")["totals"]["spend"], 5000.0)
+        self.assertEqual(len(recat.find_ops(conn, "ozon", "2026-09-01")), 2)
+
+    def test_unsplit_and_resplit(self):
+        conn, rows = self._conn()
+        fp = rows[0].fingerprint
+        recat.split(conn, fp, [("Красота", 200_000), ("Подарки", 300_000)])
+        recat.split(conn, fp, [("Подарки", 500_000 - 100_000), ("Красота", 100_000)])
+        self.assertEqual(len(recat.find_ops(conn, "ozon", "2026-09-01")), 2)
+        child = recat.find_ops(conn, "ozon", "2026-09-01")[0]["fingerprint"]
+        self.assertEqual(recat.unsplit(conn, child), 2)
+        found = recat.find_ops(conn, "ozon", "2026-09-01")
+        self.assertEqual([(o["fingerprint"], o["category"]) for o in found], [(fp, "Покупки")])

@@ -35,7 +35,7 @@ def build_tables(conn: sqlite3.Connection, start: str | None = None) -> tuple[li
     start = start or default_start()
     rows = conn.execute(
         "SELECT date, type, category, merchant, amount_kop, source FROM transactions "
-        "WHERE date >= ? AND type NOT IN ('duplicate', 'technical') ORDER BY date DESC, id DESC", (start,)).fetchall()
+        "WHERE date >= ? AND type NOT IN ('duplicate', 'technical', 'split') ORDER BY date DESC, id DESC", (start,)).fetchall()
 
     detail: list[list] = [["Дата", "Тип", "Категория", "Описание", "Сумма, ₽", "Откуда"]]
     for d, t, cat, merchant, kop, src in rows:

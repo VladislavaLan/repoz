@@ -32,6 +32,7 @@ import database as db  # noqa: E402
 import sheets_engine  # noqa: E402
 from chart_engine import build_month_chart  # noqa: E402
 from debt_engine import avalanche_savings  # noqa: E402
+from statements import config as stcfg  # noqa: E402
 from statements import insights, manual, recat, screenshot, sheets_export  # noqa: E402
 from statements import normalize as nz  # noqa: E402
 from statements.importer import write as write_txns  # noqa: E402
@@ -540,6 +541,10 @@ async def cmd_sheet(message: Message) -> None:
 # ---------- /top и /recat (ручная правка категорий) ----------
 
 _recat_sessions: dict[str, dict] = {}
+
+
+class SplitOp(StatesGroup):
+    parts = State()
 _RC_PAGE = 8
 
 
@@ -559,7 +564,7 @@ def _rc_text(p: dict) -> str:
     for i in range(page * _RC_PAGE, min(len(ops), (page + 1) * _RC_PAGE)):
         o = ops[i]
         mark = "✅" if i in p["sel"] else "▫️"
-        plan = " 📌" if o["planned"] else ""
+        plan = (" 📌" if o["planned"] else "") + (" ✂️" if recat.SPLIT_MARK in o["fingerprint"] else "")
         lines.append(f"{mark} {i + 1}. {o['date'][8:]}.{o['date'][5:7]} · {_ru(-o['kop'])} · "
                      f"{escape(o['category'])}{plan}")
     if p["sel"]:
@@ -584,6 +589,8 @@ def _rc_kb(token: str, p: dict) -> InlineKeyboardMarkup:
         rows.append(nav)
     rows.append([InlineKeyboardButton(text="🏷 Категория отмеченным", callback_data=f"rc:{token}:cm")])
     rows.append([InlineKeyboardButton(text="📌 Плановая трата вкл/выкл", callback_data=f"rc:{token}:pl")])
+    rows.append([InlineKeyboardButton(text="✂️ Разбить отмеченную на части", callback_data=f"rc:{token}:sp"),
+                 InlineKeyboardButton(text="↩ Отменить разбивку", callback_data=f"rc:{token}:us")])
     rows.append([InlineKeyboardButton(text="🏪 Правило для всех такого магазина", callback_data=f"rc:{token}:rm")])
     rows.append([InlineKeyboardButton(text="Закрыть", callback_data=f"rc:{token}:cl")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -661,6 +668,28 @@ async def on_top_button(cb: CallbackQuery) -> None:
     await _open_recat(cb.message, cb.from_user.id, p["names"][int(i)])
 
 
+@router.message(SplitOp.parts, F.text, ~F.text.startswith("/"))
+async def split_parts(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    p = _recat_sessions.get(data.get("token", ""))
+    if not p or p["user"] != message.from_user.id:
+        await state.clear()
+        await message.answer("Список устарел. Откройте /recat ещё раз.")
+        return
+    op = p["ops"][data["i"]]
+    try:
+        parts = recat.parse_split(message.text, -op["kop"], nz.all_categories(), stcfg.load().get("category_aliases", {}))
+        await asyncio.to_thread(_db_call, recat.split, op["fingerprint"], parts)
+    except ValueError as e:
+        await message.answer(f"⚠️ {escape(str(e))}\nПопробуйте ещё раз или /cancel.")
+        return
+    await state.clear()
+    _recat_sessions.pop(data["token"], None)
+    await message.answer("✂️ Готово: " + " + ".join(f"{escape(c)} {_ru(k)}" for c, k in parts)
+                         + ". Общая сумма не изменилась. Чтобы увидеть это в таблице, отправьте /sheet.")
+    await _open_recat(message, message.from_user.id, p["query"])
+
+
 def _rc_apply(kind: str, fps: list[str], arg: str) -> int:
     conn = sqlite3.connect(db.DB_PATH)
     try:
@@ -674,7 +703,7 @@ def _rc_apply(kind: str, fps: list[str], arg: str) -> int:
 
 
 @router.callback_query(F.data.startswith("rc:"))
-async def on_recat_button(cb: CallbackQuery) -> None:
+async def on_recat_button(cb: CallbackQuery, state: FSMContext) -> None:
     if _allowed and cb.from_user.id not in _allowed:
         await cb.answer()
         return
@@ -736,6 +765,35 @@ async def on_recat_button(cb: CallbackQuery) -> None:
         p["sel"] = set()
         await refresh()
         await cb.answer(f"Готово: {len(fps)} → {cat}")
+        return
+    elif action == "sp":
+        if len(p["sel"]) != 1:
+            await cb.answer("Отметьте ровно одну операцию, которую хотите разбить.", show_alert=True)
+            return
+        i = next(iter(p["sel"]))
+        if ops[i]["kop"] >= 0:
+            await cb.answer("Разбить можно только трату, а не возврат.", show_alert=True)
+            return
+        await state.set_state(SplitOp.parts)
+        await state.update_data(token=token, i=i)
+        await cb.message.answer(
+            f"Разбиваем: {ops[i]['date'][8:]}.{ops[i]['date'][5:7]} · {escape(ops[i]['merchant'])} · <b>{_ru(-ops[i]['kop'])}</b>\n\n"
+            "Напишите части одним сообщением: сумма и категория через запятую. Последнюю сумму можно не писать — "
+            "она возьмёт остаток.\nНапример:\n<code>2000 Красота, 3000 Подарки</code>\nили <code>2000 Красота, Подарки</code>\n"
+            "Категории: " + ", ".join(nz.all_categories()) + "\n\nОтмена: /cancel")
+    elif action == "us":
+        if not p["sel"]:
+            await cb.answer("Отметьте части разбивки (они помечены ✂️).", show_alert=True)
+            return
+        fps = [ops[i]["fingerprint"] for i in sorted(p["sel"]) if recat.SPLIT_MARK in ops[i]["fingerprint"]]
+        if not fps:
+            await cb.answer("У отмеченных операций нет разбивки.", show_alert=True)
+            return
+        for fp in fps:
+            await asyncio.to_thread(_db_call, recat.unsplit, fp)
+        _recat_sessions.pop(token, None)
+        await cb.answer("Разбивка отменена")
+        await _open_recat(cb.message, cb.from_user.id, p["query"], edit=True)
         return
     elif action == "pl":
         if not p["sel"]:
