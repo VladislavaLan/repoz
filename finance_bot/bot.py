@@ -33,7 +33,7 @@ import sheets_engine  # noqa: E402
 from chart_engine import build_month_chart  # noqa: E402
 from debt_engine import avalanche_savings  # noqa: E402
 from statements import config as stcfg  # noqa: E402
-from statements import insights, manual, recat, screenshot, sheets_export  # noqa: E402
+from statements import edit_sheet, insights, manual, recat, screenshot, sheets_export  # noqa: E402
 from statements import normalize as nz  # noqa: E402
 from statements.importer import write as write_txns  # noqa: E402
 from statements.report import build_report, default_start, format_telegram  # noqa: E402
@@ -88,6 +88,7 @@ HELP_TEXT = (
     "/report <code>[ГГГГ-ММ-ДД]</code> — отчёт по загруженным банковским выпискам\n"
     "📷 Пришлите скриншот истории операций из банка — я распознаю его и предложу сохранить\n"
     "/top <code>[категория]</code> — какие магазины в категории (без названия — в «Прочее»)\n"
+    "/edit_sheet <code>[ГГГГ-ММ-ДД]</code> — вкладка в Google Таблице для массовой правки категорий; /apply_sheet — применить правки\n"
     "/add_category <code>[название]</code> — добавить свою категорию (убрать: /del_category)\n"
     "/recat <code>озон</code> — поправить категории у операций магазина, отметить плановые траты\n"
     "/sheet — выгрузить операции из выписок в Google Таблицу (вкладки «Выписки» и «Итоги по месяцам»)\n"
@@ -550,6 +551,10 @@ class SplitOp(StatesGroup):
 
 class NewCategory(StatesGroup):
     name = State()
+
+
+class RecatQuery(StatesGroup):
+    query = State()
 _RC_PAGE = 8
 
 
@@ -629,12 +634,19 @@ def _d_iso(iso: str) -> str:
 
 
 @router.message(Command("recat"))
-async def cmd_recat(message: Message, command: CommandObject) -> None:
-    if not command.args or not command.args.strip():
-        await message.answer("Напишите часть названия магазина, например <code>/recat озон</code>.\n"
-                             "Названия, которые бот видит у вас в выписках, покажет команда /top.")
+async def cmd_recat(message: Message, command: CommandObject, state: FSMContext) -> None:
+    if not command.args or not command.args.strip():           # из меню: спрашиваем, что искать, и ждём ответа
+        await state.set_state(RecatQuery.query)
+        await message.answer("Часть названия магазина или получателя? Например: <code>озон</code>.\n"
+                             "Названия, которые бот видит в выписках, покажет /top. Отмена: /cancel")
         return
     await _open_recat(message, message.from_user.id, command.args.strip())
+
+
+@router.message(RecatQuery.query, F.text, ~F.text.startswith("/"))
+async def recat_query_text(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await _open_recat(message, message.from_user.id, message.text.strip())
 
 
 _top_sessions: dict[str, dict] = {}
@@ -883,6 +895,73 @@ async def on_recat_button(cb: CallbackQuery, state: FSMContext) -> None:
     await cb.answer()
 
 
+# ---------- /edit_sheet и /apply_sheet (массовая правка категорий через Google Таблицу) ----------
+
+def _edit_sheet_export(start: str | None) -> dict:
+    spreadsheet = sheets_engine.get_spreadsheet()
+    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        return edit_sheet.export(conn, spreadsheet, start)
+    finally:
+        conn.close()
+
+
+def _edit_sheet_apply() -> dict:
+    spreadsheet = sheets_engine.get_spreadsheet()
+    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        return edit_sheet.apply(conn, spreadsheet)
+    finally:
+        conn.close()
+
+
+@router.message(Command("edit_sheet"))
+async def cmd_edit_sheet(message: Message, command: CommandObject) -> None:
+    if not sheets_engine.is_enabled():
+        await message.answer("Google Таблица не подключена (нет credentials.json или GOOGLE_SPREADSHEET_NAME в .env).")
+        return
+    start = None
+    if command.args:
+        try:
+            start = date.fromisoformat(command.args.strip()).isoformat()
+        except ValueError:
+            await message.answer("Формат: <code>/edit_sheet [ГГГГ-ММ-ДД]</code>, например <code>/edit_sheet 2026-09-01</code>. "
+                                 "Без даты возьму операции с начала прошлого месяца.")
+            return
+    wait = await message.answer("Готовлю вкладку для правок…")
+    try:
+        r = await asyncio.to_thread(_edit_sheet_export, start)
+    except Exception as e:
+        log.exception("Не удалось выгрузить вкладку правок")
+        await wait.edit_text(f"Не получилось: {escape(type(e).__name__)}. Подробности в окне бота.")
+        return
+    await wait.edit_text(
+        f"✅ Вкладка «{edit_sheet.TAB}» готова: {r['rows']} операций с {_d_iso(r['start'])}.\n\n"
+        "В таблице заполните «Новую категорию» (выбор из списка), при необходимости «Плановая» и «Разбить», "
+        "потом вернитесь и напишите /apply_sheet. Подсказка по столбцам — справа на вкладке, в столбце K.")
+
+
+@router.message(Command("apply_sheet"))
+async def cmd_apply_sheet(message: Message) -> None:
+    if not sheets_engine.is_enabled():
+        await message.answer("Google Таблица не подключена.")
+        return
+    wait = await message.answer("Читаю вкладку и применяю правки…")
+    try:
+        st = await asyncio.to_thread(_edit_sheet_apply)
+    except Exception as e:
+        log.exception("Не удалось применить правки из таблицы")
+        text = ("На таблице нет вкладки «%s». Сначала /edit_sheet." % edit_sheet.TAB
+                if type(e).__name__ == "WorksheetNotFound" else f"Не получилось: {escape(type(e).__name__)}. Подробности в окне бота.")
+        await wait.edit_text(text)
+        return
+    lines = [f"✅ Применено. Категорий изменено: {st['category']}, плановых отметок: {st['planned']}, разбивок: {st['split']}."]
+    if st["errors"]:
+        lines.append(f"⚠ Не разобрала строк: {st['errors']}. Они помечены в столбце «Результат» — исправьте и повторите /apply_sheet.")
+    lines.append("Чтобы обновить вкладки «Выписки» и «Итоги по месяцам», отправьте /sheet; новую вкладку правок получите снова через /edit_sheet.")
+    await wait.edit_text("\n".join(lines))
+
+
 # ---------- /advice (комментарии и рекомендации) ----------
 
 def _advice_parts(start: str) -> tuple[list[str], dict] | None:
@@ -1124,6 +1203,8 @@ async def main() -> None:
         BotCommand(command="report", description="Отчёт по банковским выпискам"),
         BotCommand(command="top", description="Магазины в категории (по умолчанию «Прочее»)"),
         BotCommand(command="add_category", description="Добавить свою категорию"),
+        BotCommand(command="edit_sheet", description="Правка категорий в Google Таблице"),
+        BotCommand(command="apply_sheet", description="Применить правки из Google Таблицы"),
         BotCommand(command="recat", description="Поправить категории у магазина"),
         BotCommand(command="sheet", description="Выгрузить операции в Google Таблицу"),
         BotCommand(command="advice", description="Комментарии и советы по тратам"),
