@@ -245,13 +245,13 @@ def format_result(r: Result, cards: list[Card]) -> str:
         f"({rub(r.daily_living)} в день) · после погашения карты оставляем на счёте {rub(r.reserve)}",
         "",
     ]
-    shown = [e for e in r.events if not e[1].startswith("Погашение")]
+    shown = list(r.events)
     if shown:
         L.append("<b>События</b>")
-        for d, title, amount in shown[:20]:
+        for d, title, amount in shown[:40]:
             L.append(f"• {_d(d)} {'+' if amount > 0 else '−'}{rub(abs(amount))} {title}")
-        if len(shown) > 20:
-            L.append(f"…и ещё {len(shown) - 20}")
+        if len(shown) > 40:
+            L.append(f"…и ещё {len(shown) - 40}")
         L.append("")
     if r.draws:
         L.append("<b>Когда не хватает денег, берём с кредитки</b>")
