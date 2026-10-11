@@ -105,3 +105,21 @@ class WorkdayTests(unittest.TestCase):
         it = dict(date=date(2026, 10, 25), monthly=True, workday=True)
         days = planner.occurrences(it, date(2026, 10, 11), date(2027, 1, 31))
         self.assertEqual(days, [date(2026, 10, 23), date(2026, 11, 25), date(2026, 12, 25), date(2027, 1, 25)])
+
+
+class CategoryDiveTests(unittest.TestCase):
+    def test_dive(self):
+        import sqlite3
+        from statements import category_dive
+        c = sqlite3.connect(":memory:")
+        c.execute("CREATE TABLE transactions (date TEXT, amount_kop INTEGER, type TEXT, category TEXT, merchant TEXT)")
+        rows = [("2026-09-01", -100000, "expense", "Продукты", "Пятёрочка"),
+                ("2026-09-05", -100000, "expense", "Продукты", "Лента"),
+                ("2026-10-01", -150000, "expense", "Продукты", "Пятёрочка"),
+                ("2026-10-02", -150000, "expense", "Продукты", "Лента"),
+                ("2026-10-03", -150000, "expense", "Продукты", "Лента")]
+        c.executemany("INSERT INTO transactions VALUES (?,?,?,?,?)", rows)
+        t = category_dive.build(c, "Продукты", "2026-09-01")
+        self.assertIn("2026-09", t)
+        self.assertIn("числа покупок", t)
+        self.assertIsNone(category_dive.build(c, "Кафе", "2026-09-01"))
