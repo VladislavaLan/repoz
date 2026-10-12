@@ -131,6 +131,8 @@ PROMPT = (
 )
 
 
+TEMPORARY = (500, 502, 503, 504)
+FALLBACK = (404, 429) + TEMPORARY
 MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100"
 
 
@@ -139,8 +141,10 @@ def _post(model: str, api_key: str, body: bytes, timeout: int) -> dict:
     for attempt in range(3):
         try:
             return _post_once(model, api_key, body, timeout)
-        except urllib.error.HTTPError:
-            raise
+        except urllib.error.HTTPError as e:
+            if e.code not in TEMPORARY or attempt == 2:   # перегрузка сервера: ждём и повторяем
+                raise
+            time.sleep(3 * (attempt + 1))
         except OSError:
             if attempt == 2:
                 raise
@@ -192,7 +196,7 @@ def ask_gemini(parts: list[dict], api_key: str | None = None, model: str | None 
         try:
             data = _post(model, api_key, body, timeout)
         except urllib.error.HTTPError as e:
-            if e.code not in (404, 429):
+            if e.code not in FALLBACK:
                 raise
             # Модель переименована, снята или без бесплатной квоты: пробуем другие обычные flash-модели.
             data = None
@@ -205,7 +209,7 @@ def ask_gemini(parts: list[dict], api_key: str | None = None, model: str | None 
                     model = alt
                     break
                 except urllib.error.HTTPError as e2:
-                    if e2.code not in (404, 429):
+                    if e2.code not in FALLBACK:
                         raise
                     last = e2
             if data is None:
