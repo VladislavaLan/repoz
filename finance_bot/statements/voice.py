@@ -15,7 +15,8 @@ PROMPT = (
     "Правила: номера строго из списка; категория строго из допустимых (слова вроде «еда» или «магазин» "
     "сопоставь с ближайшей допустимой); «остальное»/«все остальные» относится ко всем строкам, которым категория "
     "не названа явно; «убери»/«не считай»/«это не трата» — номер в remove; если не уверена, строку не трогай "
-    "и опиши в unclear. Не выдумывай того, чего человек не говорил.\n\n"
+    "и опиши в unclear. Если человек не знает категорию или просит подсказать, предложи самую подходящую "
+    "допустимую в suggest (без assign). Не выдумывай того, чего человек не говорил.\n\n"
     "Операции:\n{items}\n\nДопустимые категории: {cats}"
 )
 
@@ -39,9 +40,18 @@ def parse_answer(text: str, n: int, categories: list[str]) -> dict:
             assign[i] = cat
         elif 0 <= i < n:
             unknown.append(f"{i + 1}: «{v}»")
+    suggest = {}
+    for k, v in (data.get("suggest") or {}).items():
+        try:
+            i = int(k) - 1
+        except (TypeError, ValueError):
+            continue
+        cat = by_lower.get(str(v).strip().lower())
+        if 0 <= i < n and cat and i not in assign:
+            suggest[i] = cat
     remove = sorted({int(x) - 1 for x in (data.get("remove") or []) if str(x).isdigit() and 1 <= int(x) <= n})
     return {"transcript": str(data.get("transcript") or "").strip(), "assign": assign, "remove": remove,
-            "unclear": str(data.get("unclear") or "").strip(), "unknown": unknown}
+            "unclear": str(data.get("unclear") or "").strip(), "unknown": unknown, "suggest": suggest}
 
 
 def understand(audio: bytes, mime: str, items: list[str], categories: list[str]) -> dict:

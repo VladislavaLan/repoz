@@ -191,3 +191,16 @@ class VoiceTests(unittest.TestCase):
         self.assertEqual(r["remove"], [2])
         self.assertEqual(len(r["unknown"]), 1)
         self.assertEqual(voice.parse_answer("не json", 3, cats)["assign"], {})
+
+
+class ShotDupTests(unittest.TestCase):
+    def test_previous_screenshot_is_dupe(self):
+        import sqlite3
+        from datetime import date
+        from statements import screenshot, normalize as nz
+        c = sqlite3.connect(":memory:")
+        c.execute("CREATE TABLE transactions (source TEXT, fingerprint TEXT, date TEXT, amount_kop INTEGER, type TEXT)")
+        t = nz.Txn(source=screenshot.SOURCE, fingerprint="fp1", date=date(2026, 10, 11), amount_kop=-339000,
+                   type="expense", merchant="Здрасте", posted=None, category="", description="")
+        c.execute("INSERT INTO transactions VALUES (?,?,?,?,?)", (screenshot.SOURCE, "fp1", "2026-10-11", -339000, "expense"))
+        self.assertEqual(screenshot.find_statement_dupes(c, [t]), {"fp1"})

@@ -1527,7 +1527,7 @@ def _shot_text(p: dict) -> str:
         what = t.category or TYPE_LABEL.get(t.type, t.type)
         lines.append(f"{mark} {i + 1}. {t.date:%d.%m} · {escape(t.merchant)} · <b>{_ru(t.amount_kop)}</b> · {escape(what)}")
     if p["dupes"]:
-        lines += ["", "♻️ — уже есть в базе из выписки, не сохраняю."]
+        lines += ["", "♻️ — уже есть в базе (из выписки, ручных трат или прошлого скриншота), не сохраняю."]
     lines += ["", "Чтобы убрать лишнюю строку, нажмите её номер."]
     return "\n".join(lines)
 
@@ -1671,11 +1671,38 @@ async def on_voice(message: Message, bot: Bot) -> None:
         lines.append("Не знаю такой категории: " + escape(", ".join(res["unknown"])) + ". Выберите кнопкой «Категория».")
     if res["unclear"]:
         lines.append("Не поняла: " + escape(res["unclear"]))
-    await wait.edit_text("\n".join(lines))
+    sug_kb = None
+    if res["suggest"]:
+        lines.append("Предлагаю: " + ", ".join(f"{i + 1} → {escape(c)}" for i, c in res["suggest"].items())
+                     + ". Нажмите кнопку, чтобы принять.")
+        sug_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text=f"{i + 1} → {c}", callback_data=f"vs:{p['token']}:{i}-{cats.index(c)}")]
+            for i, c in res["suggest"].items() if p["txns"][i].fingerprint not in p["dupes"]])
+    await wait.edit_text("\n".join(lines), reply_markup=sug_kb)
     try:
         await p["msg"].edit_text(_shot_text(p), reply_markup=_shot_kb(p["token"], p))
     except Exception:  # сообщение со списком могли удалить
         await message.answer(_shot_text(p), reply_markup=_shot_kb(p["token"], p))
+
+
+@router.callback_query(F.data.startswith("vs:"))
+async def on_voice_suggest(cb: CallbackQuery) -> None:
+    if _allowed and cb.from_user.id not in _allowed:
+        await cb.answer()
+        return
+    _, token, pair = cb.data.split(":", 2)
+    p = _pending_shots.get(token)
+    if not p or p["user"] != cb.from_user.id:
+        await cb.answer("Этот список уже закрыт. Пришлите скриншот заново.", show_alert=True)
+        return
+    i, k = (int(x) for x in pair.split("-"))
+    _apply_category(p["txns"][i], k)
+    await cb.answer("Применила")
+    try:
+        await p["msg"].edit_text(_shot_text(p), reply_markup=_shot_kb(token, p))
+    except Exception:
+        await cb.message.answer(_shot_text(p), reply_markup=_shot_kb(token, p))
+    await cb.message.edit_text(cb.message.html_text + f"\n✅ {i + 1} → {escape(nz.all_categories()[k])}")
 
 
 SHEET_TYPES = {"expense": "expense", "income": "income", "refund": "Возврат", "p2p_out": "Перевод людям",

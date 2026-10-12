@@ -168,11 +168,16 @@ def read_screenshot(image_path: str, today: date | None = None) -> list[nz.Txn]:
 # ---------- дубли с выписками ----------
 
 def find_statement_dupes(conn: sqlite3.Connection, txns: list[nz.Txn]) -> set[str]:
-    """Отпечатки операций, которые уже есть в базе из выписки (сумма та же, дата ±1 день)."""
+    """Отпечатки операций, которые уже есть в базе: из выписки или ручных трат (сумма та же, дата ±1 день)
+    либо из прошлого скриншота (тот же отпечаток)."""
     if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='transactions'").fetchone():
         return set()
     dup = set()
     for t in txns:
+        if conn.execute("SELECT 1 FROM transactions WHERE fingerprint = ? AND source = ? LIMIT 1",
+                        (t.fingerprint, SOURCE)).fetchone():
+            dup.add(t.fingerprint)
+            continue
         lo, hi = (t.date - timedelta(days=1)).isoformat(), (t.date + timedelta(days=1)).isoformat()
         if conn.execute("SELECT 1 FROM transactions WHERE source != ? AND type != 'duplicate' AND amount_kop = ? "
                         "AND date BETWEEN ? AND ? LIMIT 1", (SOURCE, t.amount_kop, lo, hi)).fetchone():
