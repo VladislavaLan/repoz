@@ -206,6 +206,49 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
     await message.answer("❌ Действие отменено.")
 
 
+# ---------- Команды, которые ждут ввода ----------
+# Из меню Telegram команда уходит сразу, без аргументов. Если ей нужно значение, бот спрашивает его
+# и следующее сообщение обрабатывает так, как будто оно написано после команды.
+
+class AwaitArgs(StatesGroup):
+    text = State()
+
+
+_ASK = {
+    "balance": "Сколько денег на счетах и картах сейчас (без кредитных)? Напишите число, например <code>21888</code>.",
+    "reserve": "Сколько оставлять на счёте, а не нести на кредитку? Например <code>30000</code>.",
+    "living": "Сколько вы тратите в месяц на жизнь (без ЭКО и крупных разовых)? Число, например <code>110000</code>, "
+              "или слово «авто», чтобы считать по выпискам.",
+    "plan_add": "Одной строкой: дата, сумма со знаком, название. Например:\n<code>23.10.2026 +90000 Аванс</code>\n"
+                "Можно добавить слова «ежемесячно», «рабочий», «приоритет 2».",
+    "plan_del": "Номер пункта, который удалить (номера в списке выше).",
+    "debt_edit": "Одной строкой: номер долга, поле, значение. Например: <code>2 срок 12.11.2026</code>.\n"
+                 "Поля: остаток, ставка, платёж, льгота, лимит, срок, карта, название. Номера смотрите в /debts.",
+    "del_debt": "Номер долга, который удалить (номера в /debts).",
+    "cat": "Категория и, если нужно, период. Например: <code>Продукты сентябрь октябрь</code> или просто "
+           "<code>Продукты</code> (тогда последние 3 месяца).",
+    "del_category": "Название своей категории, которую убрать. Операции с ней останутся как есть, исчезнет только кнопка.",
+    "budget_set": "",
+}
+
+
+async def _ask_args(message: Message, state: FSMContext, name: str) -> None:
+    await state.set_state(AwaitArgs.text)
+    await state.update_data(cmd=name)
+    await message.answer(_ASK[name] + "\nОтмена: /cancel")
+
+
+@router.message(AwaitArgs.text, F.text, ~F.text.startswith("/"))
+async def on_await_args(message: Message, state: FSMContext) -> None:
+    name = (await state.get_data()).get("cmd")
+    await state.clear()
+    handler = _AWAIT_HANDLERS.get(name)
+    if not handler:
+        return
+    cmd = CommandObject(prefix="/", command=name, mention=None, args=message.text.strip())
+    await handler(message, cmd, state)
+
+
 # ---------- /add_expense ----------
 
 def _sync_manual() -> int:
@@ -596,7 +639,10 @@ _DEBT_EDIT_HELP = (
 
 
 @router.message(Command("debt_edit"))
-async def cmd_debt_edit(message: Message, command: CommandObject) -> None:
+async def cmd_debt_edit(message: Message, command: CommandObject, state: FSMContext) -> None:
+    if not (command.args or "").strip():
+        await _ask_args(message, state, "debt_edit")
+        return
     parts = (command.args or "").split(maxsplit=2)
     if len(parts) < 3 or not parts[0].isdigit():
         await message.answer(_DEBT_EDIT_HELP)
@@ -625,7 +671,10 @@ async def cmd_debt_edit(message: Message, command: CommandObject) -> None:
 
 
 @router.message(Command("del_debt"))
-async def cmd_del_debt(message: Message, command: CommandObject) -> None:
+async def cmd_del_debt(message: Message, command: CommandObject, state: FSMContext) -> None:
+    if not (command.args or "").strip():
+        await _ask_args(message, state, "del_debt")
+        return
     if not command.args or not command.args.strip().isdigit():
         await message.answer("Формат: <code>/del_debt id</code> (id смотрите в /debts)")
         return
@@ -690,7 +739,10 @@ _PLAN_HELP = (
 
 
 @router.message(Command("balance"))
-async def cmd_balance(message: Message, command: CommandObject) -> None:
+async def cmd_balance(message: Message, command: CommandObject, state: FSMContext) -> None:
+    if not (command.args or "").strip():
+        await _ask_args(message, state, "balance")
+        return
     try:
         value = parse_number(command.args or "")
     except ValueError:
@@ -701,7 +753,10 @@ async def cmd_balance(message: Message, command: CommandObject) -> None:
 
 
 @router.message(Command("reserve"))
-async def cmd_reserve(message: Message, command: CommandObject) -> None:
+async def cmd_reserve(message: Message, command: CommandObject, state: FSMContext) -> None:
+    if not (command.args or "").strip():
+        await _ask_args(message, state, "reserve")
+        return
     try:
         value = parse_number(command.args or "")
     except ValueError:
@@ -712,8 +767,11 @@ async def cmd_reserve(message: Message, command: CommandObject) -> None:
 
 
 @router.message(Command("living"))
-async def cmd_living(message: Message, command: CommandObject) -> None:
+async def cmd_living(message: Message, command: CommandObject, state: FSMContext) -> None:
     raw = (command.args or "").strip().lower()
+    if not raw:
+        await _ask_args(message, state, "living")
+        return
     if raw in ("авто", "auto", "-"):
         def reset(conn):
             conn.execute("DELETE FROM plan_settings WHERE key = 'living'")
@@ -734,8 +792,11 @@ async def cmd_living(message: Message, command: CommandObject) -> None:
 
 
 @router.message(Command("plan_add"))
-async def cmd_plan_add(message: Message, command: CommandObject) -> None:
+async def cmd_plan_add(message: Message, command: CommandObject, state: FSMContext) -> None:
     words = (command.args or "").split()
+    if not words:
+        await _ask_args(message, state, "plan_add")
+        return
     if len(words) < 3:
         await message.answer(_PLAN_HELP)
         return
@@ -779,7 +840,11 @@ async def cmd_plan_add(message: Message, command: CommandObject) -> None:
 
 
 @router.message(Command("plan_del"))
-async def cmd_plan_del(message: Message, command: CommandObject) -> None:
+async def cmd_plan_del(message: Message, command: CommandObject, state: FSMContext) -> None:
+    if not (command.args or "").strip():
+        await cmd_plan_list(message)
+        await _ask_args(message, state, "plan_del")
+        return
     if not command.args or not command.args.strip().isdigit():
         await message.answer("Формат: <code>/plan_del id</code> (id видны в /plan_list)")
         return
@@ -843,9 +908,12 @@ async def cmd_summary(message: Message) -> None:
 
 
 @router.message(Command("cat"))
-async def cmd_cat(message: Message, command: CommandObject) -> None:
+async def cmd_cat(message: Message, command: CommandObject, state: FSMContext) -> None:
     """/cat Продукты [период] — помесячный разбор категории: число покупок, средний чек, магазины."""
     args = (command.args or "").strip()
+    if not args:
+        await _ask_args(message, state, "cat")
+        return
     cats = sorted(nz.all_categories(), key=len, reverse=True)
     cat = next((c for c in cats if args.lower().startswith(c.lower())), None)
     if not cat:
@@ -1160,10 +1228,9 @@ async def cmd_add_category(message: Message, command: CommandObject, state: FSMC
 
 
 @router.message(Command("del_category"))
-async def cmd_del_category(message: Message, command: CommandObject) -> None:
-    if not command.args:
-        await message.answer("Напишите название своей категории, например <code>/del_category Хобби</code>. "
-                             "Операции с ней останутся как есть, исчезнет только кнопка.")
+async def cmd_del_category(message: Message, command: CommandObject, state: FSMContext) -> None:
+    if not (command.args or "").strip():
+        await _ask_args(message, state, "del_category")
         return
     name = await asyncio.to_thread(_db_call, recat.delete_category, command.args)
     await message.answer(f"Категория «{escape(name)}» убрана из списка." if name
@@ -1750,6 +1817,23 @@ async def on_shot_button(cb: CallbackQuery) -> None:
         p["removed"] ^= {i}
         await cb.message.edit_text(_shot_text(p), reply_markup=_shot_kb(token, p))
     await cb.answer()
+
+
+_AWAIT_HANDLERS = {
+    "balance": cmd_balance, "reserve": cmd_reserve, "living": cmd_living, "plan_add": cmd_plan_add,
+    "plan_del": cmd_plan_del, "debt_edit": cmd_debt_edit, "del_debt": cmd_del_debt, "cat": cmd_cat,
+    "del_category": cmd_del_category,
+}
+
+
+@router.message.outer_middleware()
+async def _drop_pending_args(handler, event: Message, data: dict):
+    """Новая команда отменяет ожидание значения для предыдущей."""
+    state = data.get("state")
+    if state is not None and event.text and event.text.startswith("/"):
+        if await state.get_state() == AwaitArgs.text.state:
+            await state.clear()
+    return await handler(event, data)
 
 
 # ---------- Запуск ----------

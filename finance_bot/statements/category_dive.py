@@ -12,6 +12,8 @@ def _rub(x: float) -> str:
 
 def build(conn: sqlite3.Connection, category: str, start: str, end: str | None = None) -> str | None:
     """start/end — ISO-даты включительно. None, если трат в категории нет."""
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='transactions'").fetchone():
+        return None
     sql = ("SELECT substr(date,1,7), merchant, -amount_kop/100.0 FROM transactions "
            "WHERE type='expense' AND category=? AND date>=?")
     args: list = [category, start]
