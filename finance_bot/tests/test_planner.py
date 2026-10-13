@@ -179,3 +179,28 @@ class BudgetTests(unittest.TestCase):
         res = budget.auto(c, today)
         self.assertEqual(res["Продукты"], 13000.0)   # 3000 в неделю * 30,4 / 7 ≈ 13 029 -> 13 000
         self.assertEqual(budget.list_limits(c)["Продукты"], 13000.0)
+
+
+class VoiceTests(unittest.TestCase):
+    def test_parse(self):
+        from statements import voice
+        cats = ["Продукты", "Кафе и рестораны"]
+        r = voice.parse_answer('{"transcript":"первая продукты","assign":{"1":"продукты","2":"Космос","9":"Продукты"},'
+                               '"remove":[3],"unclear":""}', 3, cats)
+        self.assertEqual(r["assign"], {0: "Продукты"})
+        self.assertEqual(r["remove"], [2])
+        self.assertEqual(len(r["unknown"]), 1)
+        self.assertEqual(voice.parse_answer("не json", 3, cats)["assign"], {})
+
+
+class ShotDupTests(unittest.TestCase):
+    def test_previous_screenshot_is_dupe(self):
+        import sqlite3
+        from datetime import date
+        from statements import screenshot, normalize as nz
+        c = sqlite3.connect(":memory:")
+        c.execute("CREATE TABLE transactions (source TEXT, fingerprint TEXT, date TEXT, amount_kop INTEGER, type TEXT)")
+        t = nz.Txn(source=screenshot.SOURCE, fingerprint="fp1", date=date(2026, 10, 11), amount_kop=-339000,
+                   type="expense", merchant="Здрасте", posted=None, category="", description="")
+        c.execute("INSERT INTO transactions VALUES (?,?,?,?,?)", (screenshot.SOURCE, "fp1", "2026-10-11", -339000, "expense"))
+        self.assertEqual(screenshot.find_statement_dupes(c, [t]), {"fp1"})

@@ -29,6 +29,8 @@ def _icon(cur: float, usual: float | None) -> str:
 
 def compute(conn: sqlite3.Connection, today: date, big_limit: int):
     """Недельные суммы по категориям. Возвращает dict или None, если расходов нет."""
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='transactions'").fetchone():
+        return None
     first = conn.execute("SELECT MIN(date) FROM transactions WHERE type IN ('expense','refund')").fetchone()[0]
     if not first:
         return None

@@ -131,6 +131,8 @@ PROMPT = (
 )
 
 
+TEMPORARY = (500, 502, 503, 504)
+FALLBACK = (404, 429) + TEMPORARY
 MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100"
 
 
@@ -139,8 +141,10 @@ def _post(model: str, api_key: str, body: bytes, timeout: int) -> dict:
     for attempt in range(3):
         try:
             return _post_once(model, api_key, body, timeout)
-        except urllib.error.HTTPError:
-            raise
+        except urllib.error.HTTPError as e:
+            if e.code not in TEMPORARY or attempt == 2:   # перегрузка сервера: ждём и повторяем
+                raise
+            time.sleep(3 * (attempt + 1))
         except OSError:
             if attempt == 2:
                 raise
@@ -174,17 +178,25 @@ def available_models(api_key: str, timeout: int = 30) -> list[str]:
 
 
 def ai_advice(summary: dict, api_key: str | None = None, model: str | None = None, timeout: int = 60) -> str:
-    """Запрос к Gemini API. Бросает RuntimeError с понятным текстом."""
+    return ask_gemini([{"text": PROMPT + json.dumps(summary, ensure_ascii=False)}], api_key, model, timeout)
+
+
+def ask_gemini(parts: list[dict], api_key: str | None = None, model: str | None = None, timeout: int = 60,
+               json_mode: bool = False) -> str:
+    """Запрос к Gemini API (текст и/или inline-аудио). Бросает RuntimeError с понятным текстом."""
     api_key = api_key or os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("Не задан GEMINI_API_KEY в .env (ключ берут в Google AI Studio).")
     model = model or os.getenv("GEMINI_MODEL") or DEFAULT_MODEL
-    body = json.dumps({"contents": [{"parts": [{"text": PROMPT + json.dumps(summary, ensure_ascii=False)}]}]}).encode()
+    payload: dict = {"contents": [{"parts": parts}]}
+    if json_mode:
+        payload["generationConfig"] = {"responseMimeType": "application/json"}
+    body = json.dumps(payload).encode()
     try:
         try:
             data = _post(model, api_key, body, timeout)
         except urllib.error.HTTPError as e:
-            if e.code not in (404, 429):
+            if e.code not in FALLBACK:
                 raise
             # Модель переименована, снята или без бесплатной квоты: пробуем другие обычные flash-модели.
             data = None
@@ -197,7 +209,7 @@ def ai_advice(summary: dict, api_key: str | None = None, model: str | None = Non
                     model = alt
                     break
                 except urllib.error.HTTPError as e2:
-                    if e2.code not in (404, 429):
+                    if e2.code not in FALLBACK:
                         raise
                     last = e2
             if data is None:
@@ -208,7 +220,7 @@ def ai_advice(summary: dict, api_key: str | None = None, model: str | None = Non
             raise RuntimeError("Gemini недоступен из вашего региона (включите VPN для Python/бота).") from e
         raise RuntimeError(f"Gemini вернул ошибку {e.code} (модель {model}): {text[:200]}") from e
     except OSError as e:
-        raise RuntimeError(f"Связь с Gemini оборвалась ({type(e).__name__}). Обычно это VPN: проверьте, что он включён и стабилен, и повторите /advice.") from e
+        raise RuntimeError(f"Связь с Gemini оборвалась ({type(e).__name__}). Обычно это VPN: проверьте, что он включён и стабилен, и повторите.") from e
     try:
         return data["candidates"][0]["content"]["parts"][0]["text"].strip()
     except (KeyError, IndexError):
