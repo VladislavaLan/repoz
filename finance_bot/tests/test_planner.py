@@ -204,3 +204,17 @@ class ShotDupTests(unittest.TestCase):
                    type="expense", merchant="Здрасте", posted=None, category="", description="")
         c.execute("INSERT INTO transactions VALUES (?,?,?,?,?)", (screenshot.SOURCE, "fp1", "2026-10-11", -339000, "expense"))
         self.assertEqual(screenshot.find_statement_dupes(c, [t]), {"fp1"})
+
+
+class ScreenshotParseTests(unittest.TestCase):
+    def test_separate_title_and_noise(self):
+        from datetime import date
+        from statements import screenshot as sc
+        sk = []
+        ops = sc.parse_lines(["Сегодня, 14 октября", "В Транспорт −500 ₽ ©", "Транспорт", "OZON",
+                              "−2 999 ₽ ©", "Маркетплейсы"], date(2026, 10, 14), sk)
+        self.assertEqual([(o.title, o.kop) for o in ops], [("Транспорт", 50000), ("OZON", 299900)])
+        self.assertEqual(sk, [])
+        sk = []
+        sc.parse_lines(["Сегодня, 14 октября", "OZON 2 999 ₽"], date(2026, 10, 14), sk)
+        self.assertEqual(len(sk), 1)

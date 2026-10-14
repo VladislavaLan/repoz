@@ -1595,6 +1595,9 @@ def _shot_text(p: dict) -> str:
         lines.append(f"{mark} {i + 1}. {t.date:%d.%m} · {escape(t.merchant)} · <b>{_ru(t.amount_kop)}</b> · {escape(what)}")
     if p["dupes"]:
         lines += ["", "♻️ — уже есть в базе (из выписки, ручных трат или прошлого скриншота), не сохраняю."]
+    if p.get("skipped"):
+        lines += ["", "⚠️ Не смогла разобрать (добавьте вручную через /add_expense или пришлите скриншот крупнее):"]
+        lines += [f"• {escape(x[:60])}" for x in p["skipped"][:5]]
     lines += ["", "Чтобы убрать лишнюю строку, нажмите её номер."]
     return "\n".join(lines)
 
@@ -1646,11 +1649,12 @@ def _apply_category(t, k: int) -> None:
         t.type = "income"
 
 
-def _process_shot(path: str) -> tuple[list, set]:
-    txns = screenshot.read_screenshot(path, date.today())
+def _process_shot(path: str) -> tuple[list, set, list]:
+    skipped: list[str] = []
+    txns = screenshot.read_screenshot(path, date.today(), skipped)
     conn = sqlite3.connect(db.DB_PATH)
     try:
-        return txns, screenshot.find_statement_dupes(conn, txns)
+        return txns, screenshot.find_statement_dupes(conn, txns), skipped
     finally:
         conn.close()
 
@@ -1670,7 +1674,7 @@ async def on_screenshot(message: Message, bot: Bot) -> None:
         with open(path, "wb") as f:
             f.write(buf.getvalue())
         try:
-            txns, dupes = await asyncio.to_thread(_process_shot, path)
+            txns, dupes, skipped = await asyncio.to_thread(_process_shot, path)
         except RuntimeError as e:
             await wait.edit_text(escape(str(e)))
             return
@@ -1679,7 +1683,7 @@ async def on_screenshot(message: Message, bot: Bot) -> None:
                              "Пришлите его как файл («без сжатия»), так текст читается лучше.")
         return
     token = uuid.uuid4().hex[:8]
-    p = {"user": message.from_user.id, "txns": txns, "dupes": dupes, "removed": set(), "msg": wait, "token": token}
+    p = {"user": message.from_user.id, "txns": txns, "dupes": dupes, "removed": set(), "msg": wait, "token": token, "skipped": skipped}
     _pending_shots[token] = p
     await wait.edit_text(_shot_text(p), reply_markup=_shot_kb(token, p))
 

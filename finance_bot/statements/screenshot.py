@@ -30,7 +30,7 @@ MONTHS = {
 RE_HEADER = re.compile(r"(?P<d>\d{1,2})\s+(?P<m>" + "|".join(MONTHS) + r")\b", re.IGNORECASE)
 RE_AMOUNT = re.compile(
     r"^(?P<title>.*?)\s*(?P<sign>[−–—\-+])\s?(?P<amt>\d{1,3}(?:[  ]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)"
-    r"\s*[₽РPDpрР]?\s*[^\d\s]{0,3}\s*$"
+    r"\s*[₽РPDpрР]?(?:\s*[^\d\s]){0,5}\s*$"
 )
 RE_PERSON = re.compile(r"^[А-ЯЁA-Z][а-яёa-z]+ [А-ЯЁA-Z]\.?$")
 RE_SELF = re.compile(r"себе|собственн|между своими|между счетами|накопительн", re.IGNORECASE)
@@ -96,35 +96,55 @@ def _header_date(line: str, today: date) -> date | None:
         return None
 
 
-def parse_lines(lines: list[str], today: date | None = None) -> list[ShotOp]:
+RE_UNI_SPACE = re.compile(r"[\u00a0\u2007\u2009\u202f]")
+RE_LEAD_NOISE = re.compile(r"^[A-Za-zА-ЯЁ]\s+(?=[A-ZА-ЯЁ])")     # «В Транспорт»: буква от иконки перед названием
+RE_HAS_MONEY = re.compile(r"[₽]|\d\s*[РP]\b")
+
+
+def _clean_title(title: str) -> str:
+    return RE_LEAD_NOISE.sub("", title.strip(" .·|"))
+
+
+def parse_lines(lines: list[str], today: date | None = None, skipped: list[str] | None = None) -> list[ShotOp]:
+    """skipped — сюда попадают строки с суммой, которые не удалось разобрать (чтобы сказать об этом человеку)."""
     today = today or date.today()
     day: date | None = None
     ops: list[ShotOp] = []
     cur: ShotOp | None = None
-    for line in lines:
+    prev_text = ""                                 # последняя строка без суммы: название, если оно отдельно от суммы
+    for line in (RE_UNI_SPACE.sub(" ", ln) for ln in lines):
         h = _header_date(line, today)
         if h and not RE_AMOUNT.match(line):
-            day, cur = h, None
+            day, cur, prev_text = h, None, ""
             continue
         if day is None:
             continue
         m = RE_AMOUNT.match(line)
         if m:
-            title = m["title"].strip(" .·|")
+            title = _clean_title(m["title"])
             kop = int(round(float(m["amt"].replace(" ", "").replace(" ", "").replace(",", ".")) * 100))
             # «Продукты  +4 ₽»: вторая строка операции с кешбэком, а не новая операция
             if cur and not cur.category and m["sign"] == "+" and kop < 100_000 and title:
                 cur.category = title
                 continue
+            if not title and m["sign"] != "+" and prev_text:
+                title = _clean_title(prev_text)          # название распозналось отдельной строкой над суммой
+                prev_text = ""
             if not title:
+                if m["sign"] != "+" and skipped is not None:
+                    skipped.append(line)                  # расход без названия: покажем человеку
                 continue                       # одинокая сумма (кешбэк) — пропускаем
             cur = ShotOp(day=day, sign="+" if m["sign"] == "+" else "-", kop=kop, title=title)
             ops.append(cur)
-        elif cur is not None:
-            if not cur.category:
-                cur.category = line
-            else:
-                cur.context.append(line)       # «Перевод собственных средств» и т.п.
+        else:
+            if RE_HAS_MONEY.search(line) and skipped is not None:
+                skipped.append(line)           # похоже на сумму, но не разобралась
+            elif cur is not None:
+                if not cur.category:
+                    cur.category = line
+                else:
+                    cur.context.append(line)   # «Перевод собственных средств» и т.п.
+            prev_text = line
     return ops
 
 
@@ -160,9 +180,9 @@ def to_txns(ops: list[ShotOp]) -> list[nz.Txn]:
     return out
 
 
-def read_screenshot(image_path: str, today: date | None = None) -> list[nz.Txn]:
+def read_screenshot(image_path: str, today: date | None = None, skipped: list[str] | None = None) -> list[nz.Txn]:
     from .importer import dedupe
-    return dedupe(to_txns(parse_lines(ocr_lines(image_path), today)))
+    return dedupe(to_txns(parse_lines(ocr_lines(image_path), today, skipped)))
 
 
 # ---------- дубли с выписками ----------
