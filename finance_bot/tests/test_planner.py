@@ -218,3 +218,22 @@ class ScreenshotParseTests(unittest.TestCase):
         sk = []
         sc.parse_lines(["Сегодня, 14 октября", "OZON 2 999 ₽"], date(2026, 10, 14), sk)
         self.assertEqual(len(sk), 1)
+
+
+class InterestTests(unittest.TestCase):
+    def test_paid_card_accrues_interest(self):
+        from datetime import date
+        from statements import planner as pl
+        card = pl.Card(name="Сбер", balance=600000, limit=700000, rate=18.0, min_payment=24300,
+                       due_date=date(2026, 11, 12))
+        r = pl.simulate([], [card], 1_000_000, date(2026, 10, 24), date(2027, 1, 31), 0.0)
+        # без процентов было бы 600000 - 3*24300 = 527100; с процентами заметно больше
+        self.assertGreater(r.cards_end["Сбер"], 545000)
+        self.assertGreater(r.interest["Сбер"], 25000)
+
+    def test_grace_card_no_interest(self):
+        from datetime import date
+        from statements import planner as pl
+        card = pl.Card(name="Альфа", balance=100000, limit=300000, rate=58.0, grace_end=date(2027, 1, 31))
+        r = pl.simulate([], [card], 1_000_000, date(2026, 10, 24), date(2027, 1, 31), 0.0)
+        self.assertEqual(r.interest.get("Альфа", 0.0), 0.0)

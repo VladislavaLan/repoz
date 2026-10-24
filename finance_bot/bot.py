@@ -184,6 +184,7 @@ HELP_TEXT = (
     "/today — сколько можно потратить сегодня в рамках лимитов\n"
     "/week — траты за 7 дней по категориям: где выше обычного, где в норме\n"
     "/cat <code>категория [период]</code> — разбор категории: покупки, средний чек, магазины, рост из-за цен или привычек\n"
+    "/debt_sums — обновить только суммы долгов: «152300 =» (= — без изменений)\n"
     "/summary — компактная сводка по месяцам и категориям (можно показать ассистенту)\n"
     "/cancel — отменить текущий диалог"
 )
@@ -228,7 +229,8 @@ _ASK = {
     "cat": "Категория и, если нужно, период. Например: <code>Продукты сентябрь октябрь</code> или просто "
            "<code>Продукты</code> (тогда последние 3 месяца).",
     "del_category": "Название своей категории, которую убрать. Операции с ней останутся как есть, исчезнет только кнопка.",
-    "budget_set": "",
+    "debt_sums": "Пришлите новые суммы долга по порядку, через пробел или с новой строки. "
+                 "«=» — оставить без изменений. Например: <code>152300 =</code>",
 }
 
 
@@ -668,6 +670,43 @@ async def cmd_debt_edit(message: Message, command: CommandObject, state: FSMCont
         await message.answer("✅ Обновлено. Смотреть: /debts")
     else:
         await message.answer("Долг с таким id не найден.")
+
+
+@router.message(Command("debt_sums"))
+async def cmd_debt_sums(message: Message, command: CommandObject, state: FSMContext) -> None:
+    """/debt_sums — быстро обновить только суммы долгов (остальное без изменений)."""
+    debts = await db.get_debts()
+    if not debts:
+        await message.answer("Долгов пока нет. Добавить: /add_debt")
+        return
+    args = (command.args or "").strip()
+    if not args:
+        lines = [f"{i + 1}. {escape(d.name)}: {money(d.total_amount)}" for i, d in enumerate(debts)]
+        await message.answer("<b>Сейчас в боте</b>\n" + "\n".join(lines) + "\n")
+        await _ask_args(message, state, "debt_sums")
+        return
+    tokens = [t for t in re.split(r"[\s;]+", args) if t]
+    if len(tokens) != len(debts):
+        await message.answer(f"Нужно {len(debts)} знач. по порядку долгов (сейчас {len(tokens)}). "
+                             "Для долга без изменений напишите «=». Например: <code>152300 =</code>")
+        return
+    changed, bad = [], []
+    for d, tok in zip(debts, tokens):
+        if tok in ("=", "-", "—"):
+            continue
+        try:
+            value = parse_number(tok)
+            if value < 0:
+                raise ValueError
+        except ValueError:
+            bad.append(tok)
+            continue
+        await db.update_debt(d.id, total_amount=value)
+        changed.append(f"{escape(d.name)}: {money(d.total_amount)} → {money(value)}")
+    if bad:
+        await message.answer("Не поняла: " + escape(", ".join(bad)) + ". Остальное применила. Повторите для них /debt_sums.")
+    await message.answer(("✅ Обновила:\n" + "\n".join(changed) + "\n\nПрогноз: /plan") if changed
+                         else "Ничего не изменила. Прогноз: /plan")
 
 
 @router.message(Command("del_debt"))
@@ -1826,7 +1865,7 @@ async def on_shot_button(cb: CallbackQuery) -> None:
 _AWAIT_HANDLERS = {
     "balance": cmd_balance, "reserve": cmd_reserve, "living": cmd_living, "plan_add": cmd_plan_add,
     "plan_del": cmd_plan_del, "debt_edit": cmd_debt_edit, "del_debt": cmd_del_debt, "cat": cmd_cat,
-    "del_category": cmd_del_category,
+    "del_category": cmd_del_category, "debt_sums": cmd_debt_sums,
 }
 
 
@@ -1883,6 +1922,7 @@ async def main() -> None:
         BotCommand(command="advice", description="Комментарии и советы по тратам"),
         BotCommand(command="add_debt", description="Добавить долг"),
         BotCommand(command="debts", description="Долги, кредитки, дедлайны"),
+        BotCommand(command="debt_sums", description="Обновить суммы по кредиткам"),
         BotCommand(command="debt_edit", description="Поменять данные по долгу"),
         BotCommand(command="plan", description="Прогноз денег по дням"),
         BotCommand(command="plan_add", description="Добавить приход или трату в план"),

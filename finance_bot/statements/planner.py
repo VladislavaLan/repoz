@@ -148,6 +148,7 @@ class Result:
     cards_peak: dict[str, float] = field(default_factory=dict)
     month_marks: list[tuple[date, float, dict[str, float]]] = field(default_factory=list)
     unpaid_at_deadline: dict[str, float] = field(default_factory=dict)       # остаток к дате конца льготы
+    interest: dict[str, float] = field(default_factory=dict)                 # начисленные проценты за период
 
 
 def baseline_daily(report: dict | None) -> float:
@@ -180,6 +181,11 @@ def simulate(items: list[dict], cards: list[Card], start_balance: float, today: 
     while day <= end:
         if day > today:
             bal -= daily_living
+            for c in cards:                               # проценты: только вне беспроцентного периода
+                if c.rate and c.balance > 0 and not (c.grace_end and c.grace_end >= day):
+                    add = c.balance * c.rate / 100 / 365
+                    c.balance += add
+                    res.interest[c.name] = res.interest.get(c.name, 0.0) + add
         income_today = False
         for title, amount in plan.get(day, []):
             res.events.append((day, title, amount))
@@ -230,6 +236,10 @@ def simulate(items: list[dict], cards: list[Card], start_balance: float, today: 
     return res
 
 
+def res_interest_items(r: Result) -> list[tuple[str, float]]:
+    return [(n, v) for n, v in r.interest.items() if v >= 1]
+
+
 def rub(x: float) -> str:
     return f"{x:,.0f}".replace(",", " ") + " ₽"
 
@@ -275,6 +285,8 @@ def format_result(r: Result, cards: list[Card]) -> str:
         if c.grace_end:
             peak = r.cards_peak.get(c.name, c.balance)
             L.append(f"• {c.name}: пик долга {rub(peak)}" + (f" из {rub(c.limit)}" if c.limit else ""))
+    for name, total in res_interest_items(r):
+        L.append(f"• {name}: проценты за период ≈ {rub(total)} (вне беспроцентного периода, по ставке карты)")
     L.append("")
     L.append("<b>Долги на конец месяца</b>")
     for d, bal, cs in r.month_marks:
